@@ -31,7 +31,7 @@ class TokenBudgetTracker:
         spend_cap_usd: Optional[float] = None,
         initial_model_tier: str = "standard",
     ) -> None:
-        self.token_cap = token_cap if token_cap is not None else 200_000
+        self.token_cap = token_cap if token_cap is not None else 20
         self.spend_cap_usd = spend_cap_usd if spend_cap_usd is not None else PROJECT_BUDGET_USD
         self.current_model_tier = initial_model_tier
         self.tokens_used = 0

@@ -40,7 +40,10 @@ def optimizer(state: HackathonAppState) -> HackathonAppState:
 
 
 def estimator(state: HackathonAppState) -> HackathonAppState:
-    tokens_in = estimate_tokens(state.extracted_slice_context or state.user_request)
+    text = state.extracted_slice_context or state.user_request
+    # Use a simple but realistic token approximation for demo mode:
+    # count characters and divide by 4 to approximate token count.
+    tokens_in = max(1, int(len(text) / 4))
     tokens_out = 2000
     result = check_budget(tokens_in, tokens_out, state.selected_model_tier)
     state.projected_token_cost_usd = result.get("projected_cost_usd", 0.0)

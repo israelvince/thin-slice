@@ -11,6 +11,12 @@ data/
 sandbox_repo/output/
 *.csv
 
+# Backup folders created by previous exports
+eng_backup*/
+
+# Project source artifacts to ignore (optionally keep only source you want tracked)
+src/
+
 # Editor & OS files
 .DS_Store
 .vscode/

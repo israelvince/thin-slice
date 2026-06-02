@@ -1,0 +1,21 @@
+# Python artifacts
+__pycache__/
+*.py[cod]
+
+# Virtual environments
+.venv/
+venv/
+
+# Data and outputs
+data/
+sandbox_repo/output/
+*.csv
+
+# Editor & OS files
+.DS_Store
+.vscode/
+.idea/
+
+# Build artifacts
+build/
+dist/

@@ -65,10 +65,7 @@ def run_mock(user_request: str, target_repo: str):
                 final_state = mock_nodes.estimator(final_state)
                 final_state = mock_nodes.generator(final_state)
             except BudgetExceeded as be:
-                # Attempt mitigation: try switching model to cheaper tier once and retry
                 logger.warning("Budget exceeded during generation: %s", be)
-                cur = set()
-                # Try to switch to cheaper model via tracker and retry generation once.
                 switched = tracker.switch_to_cheaper()
                 if switched:
                     logger.info("Retrying optimizer/estimator/generator after switching model tier to conserve budget")
@@ -122,7 +119,7 @@ def run_mock(user_request: str, target_repo: str):
                 fh.write(content)
             persisted_changes[rel_path] = content
 
-    # If a sandbox processing script was generated, try running it to produce outputs
+        # If a sandbox processing script was generated, try running it to produce outputs
         output_files = {}
         try:
             # prefer venv python if available in eng/.venv

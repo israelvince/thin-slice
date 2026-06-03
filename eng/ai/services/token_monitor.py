@@ -13,6 +13,7 @@ route to the unhappy path.
 from __future__ import annotations
 
 import logging
+import os
 from typing import Optional
 
 from ..services.cost_policy import estimate_cost, PRICING, PROJECT_BUDGET_USD
@@ -31,11 +32,25 @@ class TokenBudgetTracker:
         spend_cap_usd: Optional[float] = None,
         initial_model_tier: str = "standard",
     ) -> None:
-        self.token_cap = token_cap if token_cap is not None else 20
-        self.spend_cap_usd = spend_cap_usd if spend_cap_usd is not None else PROJECT_BUDGET_USD
+        # Allow demo override via environment variables for easier local testing
+        env_token_cap = None
+        try:
+            env_token_cap = int(os.environ.get('THIN_SLICE_TOKEN_CAP')) if os.environ.get('THIN_SLICE_TOKEN_CAP') else None
+        except Exception:
+            env_token_cap = None
+
+        env_spend_cap = None
+        try:
+            env_spend_cap = float(os.environ.get('THIN_SLICE_SPEND_CAP_USD')) if os.environ.get('THIN_SLICE_SPEND_CAP_USD') else None
+        except Exception:
+            env_spend_cap = None
+
+        self.token_cap = token_cap if token_cap is not None else (env_token_cap if env_token_cap is not None else 20000)
+        self.spend_cap_usd = spend_cap_usd if spend_cap_usd is not None else (env_spend_cap if env_spend_cap is not None else PROJECT_BUDGET_USD)
         self.current_model_tier = initial_model_tier
         self.tokens_used = 0
         self.usd_spent = 0.0
+        logger.info("TokenBudgetTracker initialized: token_cap=%s spend_cap_usd=%.6f tier=%s", self.token_cap, self.spend_cap_usd, self.current_model_tier)
 
     def consume(self, tokens: int) -> None:
         """Record consumption of tokens. Raises BudgetExceeded if limits are breached."""

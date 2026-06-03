@@ -1,0 +1,10 @@
+pydantic==2.7.0
+pytest==7.4.0
+anthropic>=0.25.0
+slack-bolt>=1.18.0
+slack-sdk>=3.27.0
+flask>=3.0.0
+# LangGraph is optional — the runner falls back to pure-Python when not installed
+langgraph>=0.2.0
+langgraph-sdk>=0.1.39
+langchain-core>=0.1.0

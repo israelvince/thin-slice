@@ -1,0 +1,1 @@
+Shape Up (Basecamp): Work is shaped by appetite, not estimates. A thin slice should fit a fixed time budget (1-2 days max). If a slice can't be shipped in that window, it needs to be cut further. Always ask: what's the smallest version of this that delivers real value?

@@ -1,0 +1,1 @@
+Strangler Fig Pattern (Martin Fowler): Incrementally replace parts of a system by building new functionality alongside the old, routing traffic gradually. Key principle: every slice must work independently and be reversible. Never create a slice that only works when another unfinished slice is also present.

@@ -184,23 +184,19 @@ def run_mock(user_request: str, target_repo: str):
 
 
 def main():
-    p = argparse.ArgumentParser()
-    p.add_argument("--mock", action="store_true", help="run mocked pipeline")
-    p.add_argument("--request", default="Update risk_status to ENUM", help="user request text")
-    p.add_argument("--repo", default="sandbox/tails", help="target repo id")
+    p = argparse.ArgumentParser(description="Thin-Slice pipeline runner")
+    p.add_argument("--request", default="Update risk_status to ENUM", help="change request text")
+    p.add_argument("--repo", default="./demo_repo", help="path to target repo")
+    # --mock kept for backwards compatibility; the pipeline is always real now
+    p.add_argument("--mock", action="store_true", help=argparse.SUPPRESS)
     args = p.parse_args()
 
-    if args.mock:
-        result = run_mock(args.request, args.repo)
-        # Use Pydantic v2 compatible serialization
-        try:
-            serialized = result.model_dump() if hasattr(result, "model_dump") else result.dict()
-        except Exception:
-            # Fallback in case run_mock already returned a dict
-            serialized = result if isinstance(result, dict) else getattr(result, "dict", lambda: {})()
-        print(json.dumps(serialized, indent=2))
-    else:
-        print("No runner mode selected. Use --mock for Phase 1 demo.")
+    result = run_mock(args.request, args.repo)
+    try:
+        serialized = result.model_dump() if hasattr(result, "model_dump") else result.dict()
+    except Exception:
+        serialized = result if isinstance(result, dict) else getattr(result, "dict", lambda: {})()
+    print(json.dumps(serialized, indent=2))
 
 
 if __name__ == "__main__":

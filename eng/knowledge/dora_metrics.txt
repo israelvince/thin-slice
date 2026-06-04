@@ -1,0 +1,1 @@
+DORA Metrics: High-performing teams deploy smaller batches more frequently. Batch size is the single strongest predictor of delivery performance and stability. A good slice is one that can be deployed, monitored, and rolled back independently within a single sprint.

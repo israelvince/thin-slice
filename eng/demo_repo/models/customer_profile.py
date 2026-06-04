@@ -51,3 +51,5 @@ class CustomerProfile:
 # Updated by Thin-Slice
 
 # Updated by Thin-Slice
+
+# RiskCategory enum migration — Thin-Slice

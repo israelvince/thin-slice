@@ -65,10 +65,7 @@ def run_mock(user_request: str, target_repo: str):
                 final_state = mock_nodes.estimator(final_state)
                 final_state = mock_nodes.generator(final_state)
             except BudgetExceeded as be:
-                # Attempt mitigation: try switching model to cheaper tier once and retry
                 logger.warning("Budget exceeded during generation: %s", be)
-                cur = set()
-                # Try to switch to cheaper model via tracker and retry generation once.
                 switched = tracker.switch_to_cheaper()
                 if switched:
                     logger.info("Retrying optimizer/estimator/generator after switching model tier to conserve budget")
@@ -122,24 +119,20 @@ def run_mock(user_request: str, target_repo: str):
                 fh.write(content)
             persisted_changes[rel_path] = content
 
-    # If a sandbox processing script was generated, try running it to produce outputs
+        # If a sandbox processing script was generated, try running it to produce outputs
         output_files = {}
         try:
-            # prefer venv python if available in eng/.venv
-            venv_python = None
-            candidate = os.path.join(os.getcwd(), 'eng', '.venv', 'bin', 'python')
-            if os.path.exists(candidate):
-                venv_python = candidate
-            runner_python = venv_python or sys.executable
+            runner_python = sys.executable
 
             # Look for the sandbox_repo/process_orders.py we wrote
             proc_script = os.path.join(repo_dir, 'sandbox_repo', 'process_orders.py')
             if os.path.exists(proc_script):
                 logger.info(f"Running generated processing script: {proc_script}")
-                # Ensure output dir exists
                 outdir = os.path.join(repo_dir, 'sandbox_repo', 'output')
                 os.makedirs(outdir, exist_ok=True)
-                # Run script with args: --input pointing at eng/data/ecommerce/olist_orders_dataset.csv if present
+                # Resolve data path relative to this script's directory (eng/)
+                eng_dir = os.path.dirname(os.path.abspath(__file__))
+                default_input = os.path.join(eng_dir, 'data', 'ecommerce', 'olist_orders_dataset.csv')
                 default_input = os.path.join(os.getcwd(), 'eng', 'data', 'ecommerce', 'olist_orders_dataset.csv')
                 default_output = os.path.join(outdir, 'cltv_generated.csv')
                 cmd = [runner_python, proc_script, '--input', default_input, '--output', default_output]

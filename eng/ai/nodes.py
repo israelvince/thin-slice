@@ -92,6 +92,27 @@ def generator(state: HackathonAppState) -> HackathonAppState:
     return state
 
 
+def _best_target(affected_files: list, output: str) -> str:
+    """Pick the most appropriate file for the generated output.
+
+    Prefers model/schema files for Python code output, avoids README.md
+    as the primary change target.
+    """
+    if not affected_files or affected_files[0] == "<unspecified>":
+        return "generated/changes.py"
+
+    is_python = "def " in output or "class " in output or "import " in output
+
+    if is_python:
+        # Prefer: model file → any .py that isn't a test → first file
+        candidates = [f for f in affected_files if f.endswith(".py")]
+        model_file = next((f for f in candidates if "model" in f.lower()), None)
+        non_test = next((f for f in candidates if "test" not in f.lower()), None)
+        return model_file or non_test or candidates[0] if candidates else affected_files[0]
+
+    return affected_files[0]
+
+
 def _build_changes(state: HackathonAppState) -> dict:
     # Try real LLM first
     llm_output = generate_code(
@@ -100,12 +121,8 @@ def _build_changes(state: HackathonAppState) -> dict:
         state.selected_model_tier,
     )
     if llm_output:
-        target = (
-            state.affected_files[0]
-            if state.affected_files and state.affected_files[0] != "<unspecified>"
-            else "generated/changes.py"
-        )
-        logger.info("Generator: LLM produced output for %s", target)
+        target = _best_target(state.affected_files, llm_output)
+        logger.info("Generator: produced output for %s", target)
         return {target: llm_output}
 
     # Mock fallback: CLTV demo only when running against the sandbox_repo directory.

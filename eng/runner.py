@@ -167,7 +167,24 @@ def run_mock(user_request: str, target_repo: str):
         for k, v in output_files.items():
             pr_changes[k] = v
 
-        pr_url = create_pr_stub(final_state.target_repo, branch_name="thin-slice-demo", changes=pr_changes)
+        # Find git root so we create a real PR on the parent repo, not a local stub
+        import uuid as _uuid
+        import re as _re
+        try:
+            root_result = subprocess.run(
+                ["git", "-C", final_state.target_repo, "rev-parse", "--show-toplevel"],
+                capture_output=True, text=True, timeout=5,
+            )
+            repo_root = root_result.stdout.strip() if root_result.returncode == 0 else final_state.target_repo
+            rel_prefix = os.path.relpath(os.path.abspath(final_state.target_repo), os.path.abspath(repo_root))
+            prefixed_changes = (
+                pr_changes if rel_prefix == "."
+                else {os.path.join(rel_prefix, k): v for k, v in pr_changes.items()}
+            )
+            branch = "thin-slice/" + _re.sub(r"[^a-z0-9-]", "-", final_state.user_request[:40].lower()).strip("-")
+            pr_url = create_pr_stub(repo_root, branch, prefixed_changes)
+        except Exception:
+            pr_url = create_pr_stub(final_state.target_repo, "thin-slice-demo", pr_changes)
         final_state.pull_request_url = pr_url
 
     # Clear tracker for cleanliness

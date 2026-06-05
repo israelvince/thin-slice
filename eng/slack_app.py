@@ -186,6 +186,56 @@ def post_generated_code(say, thread_ts: str, state: HackathonAppState) -> None:
 
 # ── Agent 3 — Cost × Risk Assessment ─────────────────────────────────────────
 
+def _extract_change_subject(user_request: str) -> str:
+    """Pull the key entity being changed out of the request string."""
+    # CamelCase identifier (e.g. RiskCategory)
+    camel = re.findall(r'\b[A-Z][a-z]+[A-Z][a-zA-Z]*\b', user_request)
+    if camel:
+        return camel[0]
+    # snake_case field (e.g. risk_level)
+    snake = re.findall(r'\b[a-z]+_[a-z_]+\b', user_request)
+    if snake:
+        return snake[0]
+    # Fallback: first substantial noun after a verb
+    for verb in ("replace", "add", "migrate", "refactor", "update", "introduce"):
+        m = re.search(rf'{verb}\s+(\w+)', user_request, re.I)
+        if m:
+            return m.group(1)
+    return "the change"
+
+
+def _compute_risk(files: List[str], snippets: Dict[str, str]) -> tuple:
+    """Return (overall_risk, risk_score, folder_counts, no_test_count, coupled_files)."""
+    folder_counts = {
+        cat: sum(1 for f in files if folder_category(f) == cat)
+        for cat in ("models", "core", "tests", "docs", "config", "readme", "other")
+    }
+    no_test_count = sum(
+        1 for f in files
+        if "test" not in f.lower()
+        and not re.search(r"\b(def test_|pytest|unittest|class Test)", snippets.get(f, ""), re.I)
+    )
+    # Coupling: model + core files that reference the same field are coupled
+    coupled = (
+        [f for f in files if folder_category(f) in ("models", "core")]
+        if folder_counts["models"] > 0 and folder_counts["core"] > 0
+        else []
+    )
+    risk_score = (
+        (2 if folder_counts["models"] > 0 else 0)
+        + (2 if folder_counts["core"] > 0 else 0)
+        + min(no_test_count, 2)
+    )
+    overall_risk = "HIGH" if risk_score >= 3 else "MEDIUM" if risk_score == 2 else "LOW"
+    return overall_risk, risk_score, folder_counts, no_test_count, coupled
+
+
+def _shipping_risk_triggered(files: List[str], snippets: Dict[str, str]) -> bool:
+    """Return True when shipping risk alone justifies the go/no-go gate."""
+    overall_risk, _, _, _, _ = _compute_risk(files, snippets)
+    return overall_risk == "HIGH"
+
+
 def post_budget_check(say, thread_ts: str, token_count: int) -> None:
     state: Optional[HackathonAppState] = next(
         (s for (_, ts), s in pending_budget_checks.items() if ts == thread_ts),
@@ -205,7 +255,6 @@ def post_budget_check(say, thread_ts: str, token_count: int) -> None:
 
     files = state.affected_files or []
     total_cost = state.projected_token_cost_usd
-    user_intent = state.user_request[:60] if len(state.user_request) > 60 else state.user_request
 
     # ── Parse snippets ────────────────────────────────────────────────────────
     snippets: Dict[str, str] = {}
@@ -215,73 +264,110 @@ def post_budget_check(say, thread_ts: str, token_count: int) -> None:
         first_line, _, rest = chunk.partition("\n")
         snippets[first_line.strip()] = rest
 
-    # ── Risk scoring ──────────────────────────────────────────────────────────
-    folder_counts = {cat: sum(1 for f in files if folder_category(f) == cat)
-                     for cat in ("models", "core", "tests", "docs", "config", "readme", "other")}
+    overall_risk, _, folder_counts, no_test_count, coupled = _compute_risk(files, snippets)
+    subject = _extract_change_subject(state.user_request)
 
-    no_test_count = sum(
-        1 for f in files
-        if "test" not in f.lower()
-        and not re.search(r"\b(def test_|pytest|unittest|class Test)", snippets.get(f, ""), re.I)
-    )
-
-    risk_score = (
-        (2 if folder_counts["models"] > 0 else 0)
-        + (2 if folder_counts["core"] > 0 else 0)
-        + min(no_test_count, 2)
-    )
-    overall_risk = "HIGH" if risk_score >= 3 else "MEDIUM" if risk_score == 2 else "LOW"
-
-    high_folders = ", ".join(
-        label for label, cat in (("models", "models"), ("validators/pipelines", "core"))
+    # ── Risk explanation — specific, not templated ────────────────────────────
+    layers_hit = [
+        label for label, cat in (("schema layer", "models"), ("logic/validation layer", "core"))
         if folder_counts[cat] > 0
-    ) or "feature-critical areas"
+    ]
+    layers_phrase = " and ".join(layers_hit) or "feature-critical files"
+
+    if coupled:
+        coupling_warning = (
+            f"⚠️ *Coupling detected:* `{os.path.basename(coupled[0])}` defines `{subject}` "
+            f"and {len(coupled) - 1} file(s) consume it — they cannot deploy independently. "
+            f"Strangler Fig: a slice that only works when another unfinished slice is deployed "
+            f"isn't a slice — it's a dependency chain."
+        )
+    else:
+        coupling_warning = ""
+
+    coverage_note = (
+        f"{no_test_count} of {len(files)} files have no test coverage — "
+        "changes here are harder to verify and roll back safely."
+        if no_test_count > 0 else ""
+    )
 
     risk_explanation = (
-        f"{len(files)} file{'s' if len(files) != 1 else ''} touched across {high_folders}. "
-        f"{no_test_count} of {len(files)} have no test coverage."
+        f"This touches {len(files)} files across the {layers_phrase}. "
+        + (f"{coverage_note} " if coverage_note else "")
+        + (f"\n{coupling_warning}" if coupling_warning else "")
     )
 
-    # ── Knowledge-backed advice ───────────────────────────────────────────────
-    if overall_risk == "HIGH":
+    # ── Knowledge applied to THIS change ─────────────────────────────────────
+    if overall_risk == "HIGH" and coupled:
         knowledge_note = (
-            f"_DORA: {_KNOWLEDGE['dora'].split('.')[0]}._\n"
-            f"_Shape Up: {_KNOWLEDGE['shape_up'].split('.')[0]}._"
-        ) if _KNOWLEDGE.get("dora") else ""
+            f"_DORA says batch size is the strongest predictor of stability — "
+            f"shipping {len(files)} coupled files at once is a large batch._\n"
+            f"_Shape Up: can each slice ship in 1–2 days and stay green on its own? "
+            f"If `{os.path.basename(coupled[0])}` lands without its consumers updated, "
+            f"the answer is no._"
+        )
+    elif overall_risk == "HIGH":
+        knowledge_note = (
+            f"_DORA: deploy smaller batches more frequently — "
+            f"{len(files)} files across {layers_phrase} is a large batch for one shot._"
+        )
     else:
         knowledge_note = (
-            f"_Strangler Fig: {_KNOWLEDGE['strangler'].split('.')[0]}._"
-        ) if _KNOWLEDGE.get("strangler") else ""
+            f"_Strangler Fig: each slice must work independently and be reversible — "
+            f"verify that before shipping._"
+        )
 
-    # ── Build vertical slices ─────────────────────────────────────────────────
+    # ── Build slices ──────────────────────────────────────────────────────────
     def _clean_label(filename: str) -> str:
-        base = os.path.basename(filename)
-        return os.path.splitext(base)[0].replace("_", " ").replace("-", " ")
+        return os.path.splitext(os.path.basename(filename))[0].replace("_", " ").replace("-", " ")
 
     def _slice_description(filename: str) -> str:
         cat = folder_category(filename)
         label = _clean_label(filename)
+        is_coupled = filename in coupled
+        base = os.path.basename(filename)
+
         if cat == "models":
-            return f"Update the `{label}` schema — everything downstream depends on this."
+            return (
+                f"Introduce `{subject}` in `{base}` — the root contract. "
+                f"This is what {len([f for f in files if folder_category(f) == 'core'])} "
+                f"downstream file(s) will import from instead of maintaining their own copy."
+            )
         if cat == "core":
             if "validator" in filename.lower():
-                return "Add validation rules that enforce clean inputs at the boundary."
-            return f"Apply the change to `{label}` at the processing stage."
+                coupling_flag = " ⚠️ *Must ship with Slice 1* — validation breaks without the model." if is_coupled else ""
+                return (
+                    f"`{base}` currently checks `{subject}` as a raw string. "
+                    f"Replace the inline set literal with a type-level check against `{subject}`.{coupling_flag}"
+                )
+            return (
+                f"`{base}` references `{subject}` — update it to use the new contract "
+                f"from the model layer instead of its own copy."
+                + (" ⚠️ *Coupled to Slice 1.*" if is_coupled else "")
+            )
         if cat == "tests":
-            return "Extend the test suite to cover the new paths and edge cases."
+            return (
+                f"Update `{base}` to exercise `{subject}` — confirms the enum "
+                f"validates correctly and the classifier returns the right category."
+            )
         if cat == "readme":
-            return "Update README to reflect the change."
+            return f"Document the `{subject}` change in README — update the domain model table."
         return f"Apply supporting changes to `{label}`."
 
     def _worth_it(filename: str) -> str:
         cat = folder_category(filename)
-        if cat == "models":       return "Foundation — everything else depends on this."
+        is_coupled = filename in coupled
+        if cat == "models":
+            return f"Ships the root contract — without this, nothing else can move."
         if cat == "core":
             if "validator" in filename.lower():
-                return "Enforcement point — catches bad data before it propagates."
-            return "Core logic — delivers the visible change."
-        if cat == "tests":        return "Safety net — confirms nothing broke."
-        return "Supports the feature."
+                return (
+                    "Enforcement boundary — once this lands, bad strings can't reach the pipeline."
+                    + (" DORA: ship with Slice 1 (coupled)." if is_coupled else "")
+                )
+            return "Core logic update — makes the change visible at the processing stage."
+        if cat == "tests":
+            return "Shape Up: tests are the 1-day follow-on — ship in the next cycle if time is tight."
+        return "Low-risk supporting change."
 
     non_readme = [f for f in files if folder_category(f) != "readme"]
     readme_files = [f for f in files if folder_category(f) == "readme"]
@@ -290,7 +376,6 @@ def post_budget_check(say, thread_ts: str, token_count: int) -> None:
     slice_2 = [f for f in non_readme if folder_category(f) == "core"]
     slice_3 = [f for f in non_readme if folder_category(f) in ("tests", "docs", "config", "other")]
 
-    # Ensure no empty slices if files don't fit the model
     if not slice_1 and slice_2:
         slice_1.append(slice_2.pop(0))
     if not slice_2 and slice_3:
@@ -303,51 +388,63 @@ def post_budget_check(say, thread_ts: str, token_count: int) -> None:
     total_non_readme = max(len(non_readme), 1)
     cost_per_file = total_cost / total_non_readme
 
-    def _slice_cost(files_in_slice: List[str]) -> float:
-        return round(cost_per_file * len(files_in_slice), 6)
+    def _slice_cost(fs: List[str]) -> float:
+        return round(cost_per_file * len(fs), 6)
 
     emoji = {1: "🟢", 2: "🟡", 3: "🔵"}
+    titles = {1: "Define the contract", 2: "Enforce it", 3: "Prove it works"}
     slice_lines = []
     for files_in_slice, idx in slices:
         sc = _slice_cost(files_in_slice)
-        files_str = ", ".join(f"`{f}`" for f in files_in_slice)
-        bullets = "\n".join(
-            f"   • {_slice_description(f)}" for f in files_in_slice
-        )
+        files_str = ", ".join(f"`{os.path.basename(f)}`" for f in files_in_slice)
+        bullets = "\n".join(f"   • {_slice_description(f)}" for f in files_in_slice)
         worth = _worth_it(files_in_slice[0])
-        title = {1: "Define the foundation", 2: "Build the core feature", 3: "Confirm it works"}[idx]
         slice_lines.append(
-            f"{emoji[idx]} *Slice {idx} — {title}* | Cost: ${sc:.6f} | Files: {files_str}\n"
+            f"{emoji[idx]} *Slice {idx} — {titles.get(idx, 'Continue')}* | Cost: ${sc:.6f} | Files: {files_str}\n"
             f"{bullets}\n"
             f"   _{worth}_"
         )
 
-    # ── Smart move summary ────────────────────────────────────────────────────
+    # ── Smart move — coupling-aware ───────────────────────────────────────────
     s1_cost = _slice_cost(slice_1)
     s2_cost = _slice_cost(slice_2)
     s3_cost = _slice_cost(slice_3) if slice_3 else 0.0
-    smart_cost = round(s1_cost + s2_cost, 6)
-    smart_files = " + ".join(
-        f"`{f}`" for f in (slice_1[:1] + slice_2[:1])
-    ) or "slices 1+2"
 
-    readme_note = "\n\n📝 Don't forget to update README.md" if readme_files else ""
+    if coupled and slice_1 and slice_2:
+        smart_cost = round(s1_cost + s2_cost, 6)
+        s1_name = os.path.basename(slice_1[0]) if slice_1 else "Slice 1"
+        s2_name = os.path.basename(slice_2[0]) if slice_2 else "Slice 2"
+        smart_move = (
+            f"*Ship Slices 1+2 together* (`{s1_name}` + `{s2_name}`) for *${smart_cost:.6f}* — "
+            f"they're coupled by the `{subject}` contract. Splitting them leaves the system in a broken state between deploys."
+            + (f"\nSlice 3 (`{os.path.basename(slice_3[0])}`) adds test coverage for *${s3_cost:.6f}* — safe to ship next cycle." if slice_3 else "")
+        )
+    elif slice_1:
+        smart_move = (
+            f"*Start with Slice 1* (`{os.path.basename(slice_1[0])}`) for *${s1_cost:.6f}* — "
+            f"it ships independently (DORA: smallest safe batch). "
+            f"Then Slice 2 in the next sprint once Slice 1 is verified in prod."
+        )
+    else:
+        smart_move = f"Start with the first slice for *${s1_cost:.6f}*."
+
+    readme_note = "\n\n📝 Update README.md to reflect the `{subject}` change once slices land." if readme_files else ""
+
+    trigger_reason = "shipping risk" if token_count <= _BUDGET_THRESHOLD else "token budget"
 
     say(
         text=(
-            "⚠️ *Agent 3 — Cost × Risk Assessment*\n\n"
-            f"💰 Total cost: *${total_cost:.6f}* | 🔢 Tokens: *{token_count:,}* | Budget: *{_BUDGET_THRESHOLD:,}*\n"
-            f"⚠️ Risk level: *{overall_risk}*\n"
-            f"_{risk_explanation}_\n"
-            + (f"\n{knowledge_note}\n" if knowledge_note else "")
-            + "\n📊 *Verdict:* Too broad to ship safely in one shot.\n\n"
-            "*Here's what you get slice by slice:*\n\n"
+            f"⚠️ *Agent 3 — Cost × Risk Assessment* _(triggered by {trigger_reason})_\n\n"
+            f"💰 Total cost: *${total_cost:.6f}* | 🔢 Tokens: *{token_count:,}* | ⚠️ Risk: *{overall_risk}*\n\n"
+            f"{risk_explanation}\n\n"
+            f"{knowledge_note}\n\n"
+            "📊 *Verdict:* Too risky to ship as a single PR — here's how to slice it:\n\n"
             + "\n\n".join(slice_lines)
-            + f"\n\n*Smart move:* Start with {smart_files} — foundation + core logic for *${smart_cost:.6f}*."
-            + (f" Add Slice 3 for test coverage at *${s3_cost:.6f}* — low risk, high confidence." if slice_3 else "")
+            + f"\n\n*Smart move:* {smart_move}"
             + readme_note
             + "\n\n*Reply to select:*\n"
-            "*go* — run everything | *no go* — cancel | *slice 1*, *slice 2*, *slice 1 2*, *slice 1 2 3* — pick slices"
+            "*go* — ship everything | *no go* — cancel | "
+            "*slice 1*, *slice 2*, *slice 1 2*, *slice 1 2 3* — pick specific slices"
         ),
         thread_ts=thread_ts,
     )
@@ -375,7 +472,17 @@ def run_pipeline(say, channel: str, thread_ts: str, user_message: str) -> None:
     token_count = estimate_tokens(state.extracted_slice_context or state.user_request)
     post_cost_estimate(say, thread_ts, state, token_count)
 
-    if token_count > _BUDGET_THRESHOLD or not state.policy_clearance:
+    # Trigger go/no-go on financial threshold OR shipping risk (HIGH = coupled layers)
+    snippets: Dict[str, str] = {}
+    for chunk in (state.extracted_slice_context or "").split("\n# FILE: "):
+        if chunk.strip():
+            first_line, _, rest = chunk.partition("\n")
+            snippets[first_line.strip()] = rest
+
+    cost_triggered = token_count > _BUDGET_THRESHOLD or not state.policy_clearance
+    risk_triggered = _shipping_risk_triggered(state.affected_files, snippets)
+
+    if cost_triggered or risk_triggered:
         state.policy_clearance = False
         pending_budget_checks[(channel, thread_ts)] = state
         post_budget_check(say, thread_ts, token_count)

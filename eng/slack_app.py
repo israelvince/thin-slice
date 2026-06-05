@@ -23,6 +23,19 @@ DEFAULT_TARGET_REPO = os.environ.get("SLACK_TARGET_REPO", "./demo_repo")
 
 _BUDGET_THRESHOLD = int(os.environ.get("THIN_SLICE_TOKEN_THRESHOLD", "1500"))
 
+_MINS_PER_FILE = {"HIGH": 30, "MEDIUM": 20, "LOW": 12}
+_COUPLING_OVERHEAD_MINS = 30
+
+
+def _review_minutes(file_count: int, risk: str, has_coupling: bool = False) -> int:
+    return file_count * _MINS_PER_FILE.get(risk, 20) + (_COUPLING_OVERHEAD_MINS if has_coupling else 0)
+
+
+def _fmt_time(minutes: int) -> str:
+    if minutes < 60:
+        return f"~{minutes} min"
+    return f"~{minutes / 60:.1f} hr"
+
 if not SLACK_BOT_TOKEN or not SLACK_APP_TOKEN:
     raise RuntimeError(
         "SLACK_BOT_TOKEN and SLACK_APP_TOKEN must be set before starting the Slack app."
@@ -144,7 +157,7 @@ def post_slices_identified(say, thread_ts: str, state: HackathonAppState) -> Non
     tokens = estimate_tokens(state.extracted_slice_context or state.user_request)
     say(
         text=(
-            "🗂 *Agent 1 — Thin Slicer*\n"
+            "*Agent 1 — Thin Slicer*\n"
             f"Files affected:\n{format_file_list(state.affected_files)}\n"
             f"Estimated tokens: *{tokens:,}*"
         ),
@@ -153,10 +166,12 @@ def post_slices_identified(say, thread_ts: str, state: HackathonAppState) -> Non
 
 
 def post_cost_estimate(say, thread_ts: str, state: HackathonAppState, token_count: int) -> None:
+    complexity = token_count / _BUDGET_THRESHOLD
+    file_count = len(state.affected_files or [])
     say(
         text=(
-            "💰 *Agent 2 — Model Optimizer*\n"
-            f"Estimated cost: *${state.projected_token_cost_usd:.6f}*\n"
+            "*Agent 2 — Model Optimizer*\n"
+            f"Files: *{file_count}* | Complexity: *{complexity:.1f}x* safe-ship threshold | Tokens: *{token_count:,}*\n"
             f"Recommended model: {recommend_model(token_count)}"
         ),
         thread_ts=thread_ts,
@@ -165,18 +180,17 @@ def post_cost_estimate(say, thread_ts: str, state: HackathonAppState, token_coun
 
 def post_generated_code(say, thread_ts: str, state: HackathonAppState) -> None:
     if not state.generated_code_blocks:
-        say(text="✅ *Agent 4 — Code Generator*\nNo code blocks were produced.", thread_ts=thread_ts)
+        say(text="*Agent 4 — Code Generator*\nNo code blocks were produced.", thread_ts=thread_ts)
         return
 
     pr_url = state.pull_request_url
-    pr_line = f"🔗 *PR:* {pr_url}" if pr_url else "🔗 *PR:* Not created in this run"
+    pr_line = f"*PR:* {pr_url}" if pr_url else "*PR:* Not created in this run"
     files_line = ", ".join(f"`{f}`" for f in state.generated_code_blocks)
 
     say(
         text=(
-            "✅ *Agent 4 — Code Generator complete*\n\n"
-            f"📋 Files changed: {files_line}\n"
-            f"💰 Cost: *${state.projected_token_cost_usd:.6f}*\n"
+            "*Agent 4 — Code Generator complete*\n\n"
+            f"Files changed: {files_line}\n"
             f"{pr_line}\n\n"
             + format_code_blocks(state.generated_code_blocks)
         ),
@@ -245,7 +259,7 @@ def post_budget_check(say, thread_ts: str, token_count: int) -> None:
     if state is None:
         say(
             text=(
-                "⚠️ *Agent 3 — Cost × Risk Assessment*\n"
+                "*Agent 3 — Risk Assessment*\n"
                 f"Token estimate *{token_count:,}* exceeds the *{_BUDGET_THRESHOLD:,}* threshold.\n\n"
                 "Reply *go* to proceed, or *no go* to cancel."
             ),
@@ -254,8 +268,6 @@ def post_budget_check(say, thread_ts: str, token_count: int) -> None:
         return
 
     files = state.affected_files or []
-    total_cost = state.projected_token_cost_usd
-
     # ── Parse snippets ────────────────────────────────────────────────────────
     snippets: Dict[str, str] = {}
     for chunk in (state.extracted_slice_context or "").split("\n# FILE: "):
@@ -276,7 +288,7 @@ def post_budget_check(say, thread_ts: str, token_count: int) -> None:
 
     if coupled:
         coupling_warning = (
-            f"⚠️ *Coupling detected:* `{os.path.basename(coupled[0])}` defines `{subject}` "
+            f"*Coupling detected:* `{os.path.basename(coupled[0])}` defines `{subject}` "
             f"and {len(coupled) - 1} file(s) consume it — they cannot deploy independently. "
             f"Strangler Fig: a slice that only works when another unfinished slice is deployed "
             f"isn't a slice — it's a dependency chain."
@@ -334,7 +346,7 @@ def post_budget_check(say, thread_ts: str, token_count: int) -> None:
             )
         if cat == "core":
             if "validator" in filename.lower():
-                coupling_flag = " ⚠️ *Must ship with Slice 1* — validation breaks without the model." if is_coupled else ""
+                coupling_flag = " *Must ship with Slice 1* — validation breaks without the model." if is_coupled else ""
                 return (
                     f"`{base}` currently checks `{subject}` as a raw string. "
                     f"Replace the inline set literal with a type-level check against `{subject}`.{coupling_flag}"
@@ -342,7 +354,7 @@ def post_budget_check(say, thread_ts: str, token_count: int) -> None:
             return (
                 f"`{base}` references `{subject}` — update it to use the new contract "
                 f"from the model layer instead of its own copy."
-                + (" ⚠️ *Coupled to Slice 1.*" if is_coupled else "")
+                + (" *Coupled to Slice 1.*" if is_coupled else "")
             )
         if cat == "tests":
             return (
@@ -372,73 +384,106 @@ def post_budget_check(say, thread_ts: str, token_count: int) -> None:
     non_readme = [f for f in files if folder_category(f) != "readme"]
     readme_files = [f for f in files if folder_category(f) == "readme"]
 
-    slice_1 = [f for f in non_readme if folder_category(f) == "models"]
-    slice_2 = [f for f in non_readme if folder_category(f) == "core"]
-    slice_3 = [f for f in non_readme if folder_category(f) in ("tests", "docs", "config", "other")]
+    # ── Dependency graph → connected components ───────────────────────────────
+    def _dep_graph(fs: List[str]) -> Dict[str, List[str]]:
+        stem_to_path = {os.path.splitext(os.path.basename(f))[0]: f for f in fs}
+        graph: Dict[str, List[str]] = {f: [] for f in fs}
+        for f in fs:
+            for line in snippets.get(f, "").splitlines():
+                m = re.search(r'(?:from|import)\s+([\w.]+)', line)
+                if not m:
+                    continue
+                for part in m.group(1).split('.'):
+                    if part in stem_to_path and stem_to_path[part] != f:
+                        nb = stem_to_path[part]
+                        if nb not in graph[f]:
+                            graph[f].append(nb)
+        return graph
 
-    if not slice_1 and slice_2:
-        slice_1.append(slice_2.pop(0))
-    if not slice_2 and slice_3:
-        slice_2.append(slice_3.pop(0))
-    if not slice_2 and slice_1:
-        slice_2 = slice_1[1:]
-        slice_1 = slice_1[:1]
+    def _find_components(fs: List[str], graph: Dict[str, List[str]]) -> List[List[str]]:
+        parent = {f: f for f in fs}
 
-    slices = [(s, i + 1) for i, s in enumerate([slice_1, slice_2, slice_3]) if s]
-    total_non_readme = max(len(non_readme), 1)
-    cost_per_file = total_cost / total_non_readme
+        def find(x: str) -> str:
+            while parent[x] != x:
+                parent[x] = parent[parent[x]]
+                x = parent[x]
+            return x
 
-    def _slice_cost(fs: List[str]) -> float:
-        return round(cost_per_file * len(fs), 6)
+        for f, deps in graph.items():
+            for dep in deps:
+                px, py = find(f), find(dep)
+                if px != py:
+                    parent[px] = py
 
-    emoji = {1: "🟢", 2: "🟡", 3: "🔵"}
-    titles = {1: "Define the contract", 2: "Enforce it", 3: "Prove it works"}
+        groups: Dict[str, List[str]] = {}
+        for f in fs:
+            groups.setdefault(find(f), []).append(f)
+        return list(groups.values())
+
+    def _component_priority(comp: List[str]) -> int:
+        order = {"models": 0, "core": 1, "tests": 2, "docs": 2, "config": 3, "other": 3}
+        return min(order.get(folder_category(f), 3) for f in comp)
+
+    def _component_title(comp: List[str]) -> str:
+        cats = {folder_category(f) for f in comp}
+        if "models" in cats:
+            return "Define the contract"
+        if "core" in cats:
+            return "Enforce it"
+        return "Prove it works"
+
+    dep_graph = _dep_graph(non_readme)
+    components = sorted(_find_components(non_readme, dep_graph), key=_component_priority)
+    slices = [(comp, i + 1) for i, comp in enumerate(components)]
+
+    def _slice_review(fs: List[str]) -> int:
+        return _review_minutes(len(fs), overall_risk, has_coupling=any(f in coupled for f in fs))
+
     slice_lines = []
     for files_in_slice, idx in slices:
-        sc = _slice_cost(files_in_slice)
+        review_t = _fmt_time(_slice_review(files_in_slice))
         files_str = ", ".join(f"`{os.path.basename(f)}`" for f in files_in_slice)
         bullets = "\n".join(f"   • {_slice_description(f)}" for f in files_in_slice)
         worth = _worth_it(files_in_slice[0])
         slice_lines.append(
-            f"{emoji[idx]} *Slice {idx} — {titles.get(idx, 'Continue')}* | Cost: ${sc:.6f} | Files: {files_str}\n"
+            f"*Slice {idx} — {_component_title(files_in_slice)}* | Est. review: {review_t} | Files: {files_str}\n"
             f"{bullets}\n"
             f"   _{worth}_"
         )
 
-    # ── Smart move — coupling-aware ───────────────────────────────────────────
-    s1_cost = _slice_cost(slice_1)
-    s2_cost = _slice_cost(slice_2)
-    s3_cost = _slice_cost(slice_3) if slice_3 else 0.0
+    # ── Smart move ────────────────────────────────────────────────────────────
+    s_mins = [_slice_review(comp) for comp, _ in slices]
+    first_slice = slices[0][0] if slices else []
 
-    if coupled and slice_1 and slice_2:
-        smart_cost = round(s1_cost + s2_cost, 6)
-        s1_name = os.path.basename(slice_1[0]) if slice_1 else "Slice 1"
-        s2_name = os.path.basename(slice_2[0]) if slice_2 else "Slice 2"
+    if len(first_slice) > 1:
+        files_label = " + ".join(f"`{os.path.basename(f)}`" for f in first_slice)
         smart_move = (
-            f"*Ship Slices 1+2 together* (`{s1_name}` + `{s2_name}`) for *${smart_cost:.6f}* — "
-            f"they're coupled by the `{subject}` contract. Splitting them leaves the system in a broken state between deploys."
-            + (f"\nSlice 3 (`{os.path.basename(slice_3[0])}`) adds test coverage for *${s3_cost:.6f}* — safe to ship next cycle." if slice_3 else "")
+            f"*Ship Slice 1 as a unit* ({files_label}) — "
+            f"these files import each other and cannot deploy independently. "
+            f"Est. review: {_fmt_time(s_mins[0])}."
+            + (f"\nSlices 2+ are independent — ship in order and verify in prod before the next." if len(slices) > 1 else "")
         )
-    elif slice_1:
+    elif first_slice:
         smart_move = (
-            f"*Start with Slice 1* (`{os.path.basename(slice_1[0])}`) for *${s1_cost:.6f}* — "
-            f"it ships independently (DORA: smallest safe batch). "
-            f"Then Slice 2 in the next sprint once Slice 1 is verified in prod."
+            f"*Start with Slice 1* (`{os.path.basename(first_slice[0])}`) — "
+            f"{_fmt_time(s_mins[0])} of review (DORA: smallest safe batch). "
+            f"Each slice is independent — ship in order and verify before the next."
         )
     else:
-        smart_move = f"Start with the first slice for *${s1_cost:.6f}*."
+        smart_move = "No slices to ship."
 
-    readme_note = "\n\n📝 Update README.md to reflect the `{subject}` change once slices land." if readme_files else ""
+    total_review = _fmt_time(_review_minutes(len(non_readme), overall_risk, bool(coupled)))
+    readme_note = f"\n\nUpdate README.md to reflect the `{subject}` change once slices land." if readme_files else ""
 
     trigger_reason = "shipping risk" if token_count <= _BUDGET_THRESHOLD else "token budget"
 
     say(
         text=(
-            f"⚠️ *Agent 3 — Cost × Risk Assessment* _(triggered by {trigger_reason})_\n\n"
-            f"💰 Total cost: *${total_cost:.6f}* | 🔢 Tokens: *{token_count:,}* | ⚠️ Risk: *{overall_risk}*\n\n"
+            f"*Agent 3 — Risk Assessment* _(triggered by {trigger_reason})_\n\n"
+            f"Est. review: *{total_review}* | Tokens: *{token_count:,}* | Risk: *{overall_risk}*\n\n"
             f"{risk_explanation}\n\n"
             f"{knowledge_note}\n\n"
-            "📊 *Verdict:* Too risky to ship as a single PR — here's how to slice it:\n\n"
+            "*Verdict:* Too risky to ship as a single PR.\n\nThese are the recommended slices:\n\n"
             + "\n\n".join(slice_lines)
             + f"\n\n*Smart move:* {smart_move}"
             + readme_note

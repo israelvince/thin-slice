@@ -10,9 +10,10 @@ __pycache__/
 venv/
 
 # Data and outputs
-data/
 sandbox_repo/output/
 *.csv
+!data/ecommerce/*.csv
+data/ecommerce/olist_geolocation_dataset.csv
 
 # Backup folders created by previous exports
 eng_backup*/

@@ -101,7 +101,6 @@ Then mention the bot in any channel:
 eng/
 ├── runner.py                   CLI orchestrator (mock + LangGraph modes)
 ├── slack_app.py                Slack Socket Mode bot
-├── slack_handler.py            Legacy Flask webhook handler
 ├── demo_repo/                  Demo data product (Customer Transaction Intelligence)
 │   ├── models/customer_profile.py      schema with risk_level tech debt
 │   ├── pipelines/risk_classifier.py    classification logic

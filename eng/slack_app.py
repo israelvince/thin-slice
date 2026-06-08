@@ -1,12 +1,16 @@
 import logging
 import os
 import re
-from typing import Dict, Tuple
+import subprocess
+import uuid
+from typing import Dict, List, Optional, Tuple
 
-from ai import nodes as mock_nodes
+from ai import nodes as pipeline
+from ai.github_pr import create_pr_stub
 from ai.models.state import HackathonAppState
 from ai.slicer import slice_repo
 from ai.tokenizer import estimate_tokens
+
 from slack_bolt import App
 from slack_bolt.adapter.socket_mode import SocketModeHandler
 
@@ -17,8 +21,20 @@ SLACK_BOT_TOKEN = os.environ.get("SLACK_BOT_TOKEN")
 SLACK_APP_TOKEN = os.environ.get("SLACK_APP_TOKEN")
 DEFAULT_TARGET_REPO = os.environ.get("SLACK_TARGET_REPO", "./demo_repo")
 
-# Tokens above this threshold trigger the budget-warning / go-no-go flow.
 _BUDGET_THRESHOLD = int(os.environ.get("THIN_SLICE_TOKEN_THRESHOLD", "1500"))
+
+_MINS_PER_FILE = {"HIGH": 30, "MEDIUM": 20, "LOW": 12}
+_COUPLING_OVERHEAD_MINS = 30
+
+
+def _review_minutes(file_count: int, risk: str, has_coupling: bool = False) -> int:
+    return file_count * _MINS_PER_FILE.get(risk, 20) + (_COUPLING_OVERHEAD_MINS if has_coupling else 0)
+
+
+def _fmt_time(minutes: int) -> str:
+    if minutes < 60:
+        return f"~{minutes} min"
+    return f"~{minutes / 60:.1f} hr"
 
 if not SLACK_BOT_TOKEN or not SLACK_APP_TOKEN:
     raise RuntimeError(
@@ -28,36 +44,57 @@ if not SLACK_BOT_TOKEN or not SLACK_APP_TOKEN:
 app = App(token=SLACK_BOT_TOKEN)
 pending_budget_checks: Dict[Tuple[str, str], HackathonAppState] = {}
 
+# ── Knowledge context (loaded once at startup) ────────────────────────────────
+
+def _load_knowledge() -> Dict[str, str]:
+    base = os.path.join(os.path.dirname(__file__), "knowledge")
+    files = {
+        "dora": "dora_metrics.txt",
+        "shape_up": "shape_up.txt",
+        "strangler": "strangler_fig.txt",
+    }
+    out = {}
+    for key, fname in files.items():
+        try:
+            with open(os.path.join(base, fname), encoding="utf-8") as fh:
+                out[key] = fh.read().strip()
+        except Exception:
+            out[key] = ""
+    return out
+
+_KNOWLEDGE = _load_knowledge()
+
+# ── Shared helpers ────────────────────────────────────────────────────────────
+
+def folder_category(filename: str) -> str:
+    lower = filename.lower()
+    if "readme" in lower:
+        return "readme"
+    if "models/" in lower or "schema" in lower or "/model" in lower:
+        return "models"
+    if (
+        "validators/" in lower or "validator" in lower
+        or "services/" in lower or "pipeline" in lower
+    ):
+        return "core"
+    if "tests/" in lower or lower.startswith("test_") or "/test_" in lower:
+        return "tests"
+    if "docs/" in lower or lower.endswith(".md"):
+        return "docs"
+    if "config" in lower:
+        return "config"
+    return "other"
+
 
 def resolve_repo_path(target_repo: str) -> str:
     if os.path.isabs(target_repo):
         return target_repo
-    script_dir = os.path.dirname(os.path.abspath(__file__))
-    return os.path.abspath(os.path.join(script_dir, target_repo))
+    return os.path.abspath(os.path.join(os.path.dirname(__file__), target_repo))
 
 
 def extract_user_message(text: str) -> str:
-    if not text:
-        return ""
-    parts = text.split()
-    filtered = [p for p in parts if not (p.startswith("<@") and p.endswith(">"))]
-    return " ".join(filtered).strip()
-
-
-def format_file_list(files) -> str:
-    if not files:
-        return "None"
-    return "\n".join(f"• `{f}`" for f in files)
-
-
-def format_code_blocks(generated: dict) -> str:
-    blocks = []
-    for name, content in generated.items():
-        code = str(content).strip()
-        if len(code) > 3000:
-            code = code[:3000] + "\n...truncated..."
-        blocks.append(f"*File:* `{name}`\n```\n{code}\n```")
-    return "\n\n".join(blocks)
+    parts = (text or "").split()
+    return " ".join(p for p in parts if not (p.startswith("<@") and p.endswith(">"))).strip()
 
 
 def recommend_model(token_count: int) -> str:
@@ -68,11 +105,59 @@ def recommend_model(token_count: int) -> str:
     return "claude-sonnet-4-6 (large context)"
 
 
-def post_slices_identified(say, thread_ts: str, state: HackathonAppState):
+def format_file_list(files: List[str]) -> str:
+    return "\n".join(f"• `{f}`" for f in files) if files else "None"
+
+
+def format_code_blocks(generated: dict) -> str:
+    blocks = []
+    for name, content in generated.items():
+        code = str(content).strip()
+        if len(code) > 2500:
+            code = code[:2500] + "\n...truncated..."
+        blocks.append(f"*`{name}`*\n```\n{code}\n```")
+    return "\n\n".join(blocks)
+
+
+# ── PR creation ───────────────────────────────────────────────────────────────
+
+def _make_pr(state: HackathonAppState) -> Optional[str]:
+    """
+    Create a PR for the generated changes.
+    Finds the git repo root, prefixes change paths correctly,
+    then delegates to create_pr_stub (gh CLI → local stub).
+    """
+    if not state.generated_code_blocks:
+        return None
+    try:
+        result = subprocess.run(
+            ["git", "-C", state.target_repo, "rev-parse", "--show-toplevel"],
+            capture_output=True, text=True, timeout=5,
+        )
+        repo_root = result.stdout.strip() if result.returncode == 0 else state.target_repo
+        rel_prefix = os.path.relpath(
+            os.path.abspath(state.target_repo),
+            os.path.abspath(repo_root),
+        )
+        prefixed = (
+            state.generated_code_blocks
+            if rel_prefix == "."
+            else {os.path.join(rel_prefix, k): v for k, v in state.generated_code_blocks.items()}
+        )
+        branch = "thin-slice/" + re.sub(r"[^a-z0-9-]", "-", state.user_request[:40].lower()).strip("-")
+        return create_pr_stub(repo_root, branch, prefixed)
+    except Exception as exc:
+        logger.warning("PR creation failed: %s", exc)
+        return f"local://thin-slice/pull/{uuid.uuid4().hex[:8]}"
+
+
+# ── Slack post helpers ────────────────────────────────────────────────────────
+
+def post_slices_identified(say, thread_ts: str, state: HackathonAppState) -> None:
     tokens = estimate_tokens(state.extracted_slice_context or state.user_request)
     say(
         text=(
-            "🗂 *Agent 1 — Thin Slicer*\n"
+            "*Agent 1 — Thin Slicer*\n"
             f"Files affected:\n{format_file_list(state.affected_files)}\n"
             f"Estimated tokens: *{tokens:,}*"
         ),
@@ -80,409 +165,400 @@ def post_slices_identified(say, thread_ts: str, state: HackathonAppState):
     )
 
 
-def post_cost_estimate(say, thread_ts: str, state: HackathonAppState, token_count: int):
+def post_cost_estimate(say, thread_ts: str, state: HackathonAppState, token_count: int) -> None:
+    complexity = token_count / _BUDGET_THRESHOLD
+    file_count = len(state.affected_files or [])
     say(
         text=(
-            "💰 *Agent 2 — Model Optimizer*\n"
-            f"Estimated cost: *${state.projected_token_cost_usd:.6f}*\n"
+            "*Agent 2 — Model Optimizer*\n"
+            f"Files: *{file_count}* | Complexity: *{complexity:.1f}x* safe-ship threshold | Tokens: *{token_count:,}*\n"
             f"Recommended model: {recommend_model(token_count)}"
         ),
         thread_ts=thread_ts,
     )
 
 
-def post_budget_check(say, thread_ts: str, token_count: int):
-    def parse_snippets(context: str) -> Dict[str, str]:
-        snippets: Dict[str, str] = {}
-        for chunk in context.split("\n# FILE: "):
-            if not chunk.strip():
-                continue
-            first_line, _, rest = chunk.partition("\n")
-            filename = first_line.strip()
-            snippets[filename] = rest
-        return snippets
-
-    def file_risk_level(filename: str, snippet: str) -> str:
-        lower = filename.lower()
-        high_keywords = ["model", "schema", "database", "core", "order", "payment"]
-        med_keywords = ["api", "endpoint", "route", "service"]
-        low_keywords = ["util", "helper", "test", "log", "config"]
-        is_test_file = "test" in lower
-        has_test_coverage = bool(re.search(r"\b(def test_|pytest|unittest|class Test)", snippet, re.I))
-        if any(k in lower for k in high_keywords) or (not is_test_file and not has_test_coverage):
-            return "high"
-        if any(k in lower for k in med_keywords):
-            return "medium"
-        if any(k in lower for k in low_keywords) or is_test_file:
-            return "low"
-        return "medium"
-
-    def describe_file_value(filename: str, request: str, risk: str) -> str:
-        lower = filename.lower()
-        if "schema" in lower or "database" in lower or "model" in lower or "payment" in lower:
-            return f"Updates the underlying {filename} so the system can {request}."
-        if "api" in lower or "endpoint" in lower or "route" in lower:
-            return f"Adds the API surface needed to support {request}."
-        if "service" in lower:
-            return f"Implements backend service behavior for {request}."
-        if "test" in lower:
-            return f"Adds coverage so {request} stays reliable over time."
-        if "util" in lower or "helper" in lower or "log" in lower or "config" in lower:
-            return f"Improves the supporting infrastructure around {request}."
-        if risk == "high":
-            return f"Makes the core system changes required to fully deliver {request}."
-        if risk == "medium":
-            return f"Builds the main capability needed to deliver {request}."
-        return f"Delivers the safest part of {request} in {filename}."
-
-    def worth_it_line(user_intent: str, folder_name: str) -> str:
-        return f"Delivers the '{user_intent}' change to the {folder_name} layer first — lowest risk entry point"
-
-    state = None
-    for (_, ts), stored_state in pending_budget_checks.items():
-        if ts == thread_ts:
-            state = stored_state
-            break
-    if state is None:
-        # Fallback if exact state lookup fails; use the current token count only.
-        say(
-            text=(
-                "⚠️ *Agent 3 — Cost Estimator*\n"
-                f"Token estimate *{token_count:,}* exceeds the *{_BUDGET_THRESHOLD:,}* token threshold.\n\n"
-                "💡 *Thin-slice recommendation:* Break this into smaller requests, for example:\n"
-                "• First: add the schema change only\n"
-                "• Then: add the API endpoints\n"
-                "• Then: add tests\n\n"
-                "Reply *go* to proceed anyway, or *no go* to re-slice to a smaller scope."
-            ),
-            thread_ts=thread_ts,
-        )
-        return
-
-    files = state.affected_files or []
-    snippets = parse_snippets(state.extracted_slice_context or "")
-    total_files = len(files)
-    total_cost = state.projected_token_cost_usd
-    pythonuser_intent = state.user_request[:60] if len(state.user_request) > 60 else state.user_request
-
-    def folder_category(filename: str) -> str:
-        lower = filename.lower()
-        if "readme" in lower:
-            return "readme"
-        if "models/" in lower or "schema" in lower or "model" in lower:
-            return "models"
-        if "validators/" in lower or "validator" in lower or "services/" in lower or "pipeline" in lower:
-            return "core"
-        if "tests/" in lower or lower.startswith("test_") or "/test_" in lower:
-            return "tests"
-        if "docs/" in lower or lower.endswith(".md"):
-            return "docs"
-        if "config" in lower:
-            return "config"
-        return "other"
-
-    def clean_label(filename: str) -> str:
-        base = os.path.basename(filename)
-        name, _ = os.path.splitext(base)
-        return name.replace("_", " ").replace("-", " ")
-
-    def extract_request_keywords(request: str) -> list[str]:
-        lower = request.lower()
-        ordered_terms = [
-            "input validation",
-            "error handling",
-            "validation",
-            "logging",
-            "refactor",
-            "migration",
-            "endpoint",
-            "schema",
-            "test",
-            "auth",
-            "payment",
-            "order",
-            "profile",
-            "service",
-            "pipeline",
-            "security",
-            "performance",
-            "data",
-        ]
-        found: list[str] = []
-        for term in ordered_terms:
-            if term in lower and term not in found:
-                found.append(term)
-        if not found:
-            found = [w for w in re.findall(r"\w+", lower) if len(w) > 3][:3]
-        return found
-
-    def format_intent_phrase(intents: list[str]) -> str:
-        if not intents:
-            return "the requested feature"
-        if len(intents) == 1:
-            return intents[0]
-        if len(intents) == 2:
-            return f"{intents[0]} and {intents[1]}"
-        return ", ".join(intents[:-1]) + f" and {intents[-1]}"
-
-    request_keywords = extract_request_keywords(state.user_request)
-    primary_keyword = request_keywords[0] if request_keywords else "feature"
-    primary_phrase = format_intent_phrase(request_keywords)
-    model_keyword = clean_label(next((f for f in files if folder_category(f) == "models"), files[0] if files else "feature"))
-    if model_keyword.endswith("s"):
-        model_keyword = model_keyword.rstrip("s")
-
-    folder_counts = {
-        "models": sum(1 for f in files if folder_category(f) == "models"),
-        "core": sum(1 for f in files if folder_category(f) == "core"),
-        "tests": sum(1 for f in files if folder_category(f) == "tests"),
-        "docs": sum(1 for f in files if folder_category(f) == "docs"),
-        "config": sum(1 for f in files if folder_category(f) == "config"),
-        "readme": sum(1 for f in files if folder_category(f) == "readme"),
-        "other": sum(1 for f in files if folder_category(f) == "other"),
-    }
-
-    high_folder_names = [name for name in ("models", "core") if folder_counts[name] > 0]
-    high_folder_phrase = ", ".join("models" if x == "models" else "validators/pipelines" for x in high_folder_names)
-    if not high_folder_phrase:
-        high_folder_phrase = "feature-critical areas"
-
-    no_test_count = sum(
-        1
-        for f in files
-        if not bool(re.search(r"\b(def test_|pytest|unittest|class Test)", snippets.get(f, ""), re.I))
-        and "test" not in f.lower()
-    )
-
-    risk_score = 0
-    if folder_counts["models"] > 0:
-        risk_score += 2
-    if folder_counts["core"] > 0:
-        risk_score += 2
-    risk_score += min(no_test_count, 2)
-    overall_risk = "HIGH" if risk_score >= 3 else "MEDIUM" if risk_score == 2 else "LOW"
-
-    touched_phrase = f"{total_files} file{'s' if total_files != 1 else ''} touched across {high_folder_phrase}"
-    test_phrase = f"{no_test_count} of {total_files} file{'s' if total_files != 1 else ''} have no test coverage"
-    risk_explanation = (
-        f"Why {overall_risk}: {touched_phrase} — a change this broad risks cascading failures. {test_phrase}."
-    )
-
-    slice_1 = [f for f in files if folder_category(f) == "models"]
-    slice_2 = [f for f in files if folder_category(f) == "core"]
-    slice_3 = [f for f in files if folder_category(f) in {"tests", "docs", "config", "other"}]
-    readme_files = [f for f in files if folder_category(f) == "readme"]
-
-    if not slice_1 and slice_2:
-        slice_1.append(slice_2.pop(0))
-    if not slice_2 and slice_3:
-        slice_2.append(slice_3.pop(0))
-
-    # Build vertical slices based on capabilities in the user request
-    capabilities = extract_request_keywords(state.user_request)
-    all_files = [f for f in files if folder_category(f) != "readme"]
-
-    # Group files by capability match
-    slice_groups = []
-    used_files = set()
-
-    for i, capability in enumerate(capabilities[:5], start=1):
-        matched = [
-            f for f in all_files
-            if capability.lower() in f.lower() or capability.lower() in (snippets.get(f, "").lower())
-            and f not in used_files
-        ]
-        if matched:
-            used_files.update(matched)
-            slice_groups.append((f"Slice {i}", capability.title(), matched, capability))
-
-    # Any remaining files go into a final slice
-    remaining = [f for f in all_files if f not in used_files]
-    if remaining:
-        slice_groups.append((f"Slice {len(slice_groups)+1}", "Supporting changes", remaining, "other"))
-
-    if total_files == 0:
-        say(
-            text=(
-                "⚠️ *Agent 3 — Cost × Risk Assessment*\n"
-                f"💰 Total cost: *${total_cost:.6f}* | 🔢 Tokens: *{token_count:,}* | Budget: *{_BUDGET_THRESHOLD}*\n"
-                f"⚠️ Risk level: *{overall_risk}*\n{risk_explanation}\n"
-                "📊 Verdict: Too costly and risky to ship in one shot.\n\n"
-                "No affected files were identified, so there is nothing to slice here."
-            ),
-            thread_ts=thread_ts,
-        )
-        return
-
-    cost_per_file = total_cost / total_files if total_files else 0.0
-    slice_costs = [round(cost_per_file * len(group_files), 6) for _, _, group_files, _ in slice_groups]
-    remainder = round(total_cost - sum(slice_costs), 6)
-    for idx in range(len(slice_costs) - 1, -1, -1):
-        if slice_costs[idx] > 0 or idx == len(slice_costs) - 1:
-            slice_costs[idx] = round(slice_costs[idx] + remainder, 6)
-            break
-
-    def slice_description(filename: str) -> str:
-        category = folder_category(filename)
-        entity = clean_label(filename)
-        if category == "models":
-            return f"Update the {entity} schema to support the new field constraints."
-        if category == "core":
-            if "validator" in filename.lower() or "validators/" in filename.lower():
-                return "Add validation rules that enforce clean inputs before they reach the pipeline."
-            return f"Modify the {entity} to apply the change at the processing stage."
-        if category == "tests":
-            return "Extend the test suite to cover the new paths and edge cases."
-        if category == "readme":
-            return "Update README.md when done."
-        return f"Apply changes to {entity}."
-
-    def worth_it_line(filename: str) -> str:
-        category = folder_category(filename)
-        if category == "models":
-            return "Foundation — everything else depends on this."
-        if category == "core" and ("validator" in filename.lower() or "validators/" in filename.lower()):
-            return "Enforcement point — catches bad data early."
-        if category == "core":
-            return "Core logic — delivers the visible change."
-        if category == "tests":
-            return "Safety net — confirms nothing broke."
-        return "Supports the feature build."
-
-    slice_lines = []
-    for slice_index, (label, title, group_files, group_label) in enumerate(slice_groups, start=1):
-        if not group_files:
-            continue
-        group_cost = slice_costs[slice_index - 1]
-        files_str = ", ".join(f"`{f}`" for f in group_files)
-        bullet_lines = "\n".join(
-            f"   • {os.path.basename(f).replace('_',' ').replace('.py','')} — {slice_description(f)}"
-            for f in group_files
-        )
-        worth_line = worth_it_line(group_files[0])
-        emoji = "🟢" if slice_index == 1 else "🟡" if slice_index == 2 else "🔵"
-        slice_lines.append(
-            f"{emoji} *{label} — {title}* | Cost: ${group_cost:.6f} | Files: {files_str}\n"
-            f"{bullet_lines}\n"
-            f"   _{worth_line}_"
-        )
-
-    smart_12_cost = round(slice_costs[0] + slice_costs[1], 6)
-    smart_3_cost = slice_costs[2]
-    if slice_1 and slice_2:
-        slice_12_files = f"`{slice_1[0]}` + `{slice_2[0]}`"
-    elif slice_1:
-        slice_12_files = f"`{slice_1[0]}`"
-    elif slice_2:
-        slice_12_files = f"`{slice_2[0]}`"
-    else:
-        slice_12_files = "slices 1+2"
-    readme_note = "\n\n📝 Don't forget to update README.md" if readme_files else ""
-
-    say(
-        text=(
-            "⚠️ *Agent 3 — Cost × Risk Assessment*\n"
-            f"\n💰 Total cost: *${total_cost:.6f}* | 🔢 Tokens: *{token_count:,}* | Budget: *{_BUDGET_THRESHOLD}*\n"
-            f"⚠️ Risk level: *{overall_risk}*\n"
-            f"_{risk_explanation}_\n"
-            "📊 Verdict: Too costly and risky to ship in one shot.\n\n"
-            "*Here's what you get slice by slice:*\n\n"
-            + "\n\n".join(slice_lines)
-            + "\n\n"
-            f"*Smart move:* Start with {slice_12_files} — that covers the foundation and core logic for *${smart_12_cost:.6f}*. "
-            f"Slice 3 adds test coverage for *${smart_3_cost:.6f}* — low risk, high confidence."
-            + readme_note
-            + "\n\n*Select slices to run:*\nReply with *go* to run all, *no go* to cancel, or combine slice numbers like:\n- *slice 1*\n- *slice 1 2*\n- *slice 1 2 3*\n- *slice 2 3*"
-        ),
-        thread_ts=thread_ts,
-    )
-
-
-def post_generated_code(say, thread_ts: str, state: HackathonAppState):
+def post_generated_code(say, thread_ts: str, state: HackathonAppState) -> None:
     if not state.generated_code_blocks:
-        say(
-            text="✅ *Agent 4 — Code Generator*\nNo code blocks were produced.",
-            thread_ts=thread_ts,
-        )
+        say(text="*Agent 4 — Code Generator*\nNo code blocks were produced.", thread_ts=thread_ts)
         return
-    files_changed = ", ".join(f"`{f}`" for f in state.affected_files) if state.affected_files else "unknown files"
-    pr_link = state.pull_request_url if state.pull_request_url else "Ready to commit — no PR created in this run"
+
+    pr_url = state.pull_request_url
+    pr_line = f"*PR:* {pr_url}" if pr_url else "*PR:* Not created in this run"
+    files_line = ", ".join(f"`{f}`" for f in state.generated_code_blocks)
+
     say(
         text=(
-            "✅ *Done — here's what was generated*\n\n"
-            f"📋 Files changed: {files_changed}\n"
-            f"💰 Total cost: *${state.projected_token_cost_usd:.6f}*\n"
-            f"🔗 PR: {pr_link}\n\n"
+            "*Agent 4 — Code Generator complete*\n\n"
+            f"Files changed: {files_line}\n"
+            f"{pr_line}\n\n"
             + format_code_blocks(state.generated_code_blocks)
         ),
         thread_ts=thread_ts,
     )
 
 
-def reduce_slices(state: HackathonAppState) -> HackathonAppState:
-    keywords = [w for w in re.findall(r"\w+", state.user_request) if len(w) > 3][:3]
-    if not keywords and state.affected_files:
-        keywords = state.affected_files[:2]
-    repo_path = state.target_repo
-    if os.path.isdir(repo_path):
-        res = slice_repo(repo_path, keywords)
-        state.affected_files = res.get("affected_files", [])
-        state.extracted_slice_context = res.get("extracted_slice_context", "")
+# ── Agent 3 — Cost × Risk Assessment ─────────────────────────────────────────
+
+def _extract_change_subject(user_request: str) -> str:
+    """Pull the key entity being changed out of the request string."""
+    # CamelCase identifier (e.g. RiskCategory)
+    camel = re.findall(r'\b[A-Z][a-z]+[A-Z][a-zA-Z]*\b', user_request)
+    if camel:
+        return camel[0]
+    # snake_case field (e.g. risk_level)
+    snake = re.findall(r'\b[a-z]+_[a-z_]+\b', user_request)
+    if snake:
+        return snake[0]
+    # Fallback: first substantial noun after a verb
+    for verb in ("replace", "add", "migrate", "refactor", "update", "introduce"):
+        m = re.search(rf'{verb}\s+(\w+)', user_request, re.I)
+        if m:
+            return m.group(1)
+    return "the change"
+
+
+def _compute_risk(files: List[str], snippets: Dict[str, str]) -> tuple:
+    """Return (overall_risk, risk_score, folder_counts, no_test_count, coupled_files)."""
+    folder_counts = {
+        cat: sum(1 for f in files if folder_category(f) == cat)
+        for cat in ("models", "core", "tests", "docs", "config", "readme", "other")
+    }
+    no_test_count = sum(
+        1 for f in files
+        if "test" not in f.lower()
+        and not re.search(r"\b(def test_|pytest|unittest|class Test)", snippets.get(f, ""), re.I)
+    )
+    # Coupling: model + core files that reference the same field are coupled
+    coupled = (
+        [f for f in files if folder_category(f) in ("models", "core")]
+        if folder_counts["models"] > 0 and folder_counts["core"] > 0
+        else []
+    )
+    risk_score = (
+        (2 if folder_counts["models"] > 0 else 0)
+        + (2 if folder_counts["core"] > 0 else 0)
+        + min(no_test_count, 2)
+    )
+    overall_risk = "HIGH" if risk_score >= 3 else "MEDIUM" if risk_score == 2 else "LOW"
+    return overall_risk, risk_score, folder_counts, no_test_count, coupled
+
+
+def _shipping_risk_triggered(files: List[str], snippets: Dict[str, str]) -> bool:
+    """Return True when shipping risk alone justifies the go/no-go gate."""
+    overall_risk, _, _, _, _ = _compute_risk(files, snippets)
+    return overall_risk == "HIGH"
+
+
+def post_budget_check(say, thread_ts: str, token_count: int) -> None:
+    state: Optional[HackathonAppState] = next(
+        (s for (_, ts), s in pending_budget_checks.items() if ts == thread_ts),
+        None,
+    )
+
+    if state is None:
+        say(
+            text=(
+                "*Agent 3 — Risk Assessment*\n"
+                f"Token estimate *{token_count:,}* exceeds the *{_BUDGET_THRESHOLD:,}* threshold.\n\n"
+                "Reply *go* to proceed, or *no go* to cancel."
+            ),
+            thread_ts=thread_ts,
+        )
+        return
+
+    files = state.affected_files or []
+    # ── Parse snippets ────────────────────────────────────────────────────────
+    snippets: Dict[str, str] = {}
+    for chunk in (state.extracted_slice_context or "").split("\n# FILE: "):
+        if not chunk.strip():
+            continue
+        first_line, _, rest = chunk.partition("\n")
+        snippets[first_line.strip()] = rest
+
+    overall_risk, _, folder_counts, no_test_count, coupled = _compute_risk(files, snippets)
+    subject = _extract_change_subject(state.user_request)
+
+    # ── Risk explanation — specific, not templated ────────────────────────────
+    layers_hit = [
+        label for label, cat in (("schema layer", "models"), ("logic/validation layer", "core"))
+        if folder_counts[cat] > 0
+    ]
+    layers_phrase = " and ".join(layers_hit) or "feature-critical files"
+
+    if coupled:
+        coupling_warning = (
+            f"*Coupling detected:* `{os.path.basename(coupled[0])}` defines `{subject}` "
+            f"and {len(coupled) - 1} file(s) consume it — they cannot deploy independently. "
+            f"Strangler Fig: a slice that only works when another unfinished slice is deployed "
+            f"isn't a slice — it's a dependency chain."
+        )
     else:
-        state.affected_files = state.affected_files[:2]
-        state.extracted_slice_context = (state.extracted_slice_context or state.user_request)[:1500]
+        coupling_warning = ""
+
+    coverage_note = (
+        f"{no_test_count} of {len(files)} files have no test coverage — "
+        "changes here are harder to verify and roll back safely."
+        if no_test_count > 0 else ""
+    )
+
+    risk_explanation = (
+        f"This touches {len(files)} files across the {layers_phrase}. "
+        + (f"{coverage_note} " if coverage_note else "")
+        + (f"\n{coupling_warning}" if coupling_warning else "")
+    )
+
+    # ── Knowledge applied to THIS change ─────────────────────────────────────
+    if overall_risk == "HIGH" and coupled:
+        knowledge_note = (
+            f"_DORA says batch size is the strongest predictor of stability — "
+            f"shipping {len(files)} coupled files at once is a large batch._\n"
+            f"_Shape Up: can each slice ship in 1–2 days and stay green on its own? "
+            f"If `{os.path.basename(coupled[0])}` lands without its consumers updated, "
+            f"the answer is no._"
+        )
+    elif overall_risk == "HIGH":
+        knowledge_note = (
+            f"_DORA: deploy smaller batches more frequently — "
+            f"{len(files)} files across {layers_phrase} is a large batch for one shot._"
+        )
+    else:
+        knowledge_note = (
+            f"_Strangler Fig: each slice must work independently and be reversible — "
+            f"verify that before shipping._"
+        )
+
+    # ── Build slices ──────────────────────────────────────────────────────────
+    def _clean_label(filename: str) -> str:
+        return os.path.splitext(os.path.basename(filename))[0].replace("_", " ").replace("-", " ")
+
+    def _slice_description(filename: str) -> str:
+        cat = folder_category(filename)
+        label = _clean_label(filename)
+        is_coupled = filename in coupled
+        base = os.path.basename(filename)
+
+        if cat == "models":
+            return (
+                f"Introduce `{subject}` in `{base}` — the root contract. "
+                f"This is what {len([f for f in files if folder_category(f) == 'core'])} "
+                f"downstream file(s) will import from instead of maintaining their own copy."
+            )
+        if cat == "core":
+            if "validator" in filename.lower():
+                coupling_flag = " *Must ship with Slice 1* — validation breaks without the model." if is_coupled else ""
+                return (
+                    f"`{base}` currently checks `{subject}` as a raw string. "
+                    f"Replace the inline set literal with a type-level check against `{subject}`.{coupling_flag}"
+                )
+            return (
+                f"`{base}` references `{subject}` — update it to use the new contract "
+                f"from the model layer instead of its own copy."
+                + (" *Coupled to Slice 1.*" if is_coupled else "")
+            )
+        if cat == "tests":
+            return (
+                f"Update `{base}` to exercise `{subject}` — confirms the enum "
+                f"validates correctly and the classifier returns the right category."
+            )
+        if cat == "readme":
+            return f"Document the `{subject}` change in README — update the domain model table."
+        return f"Apply supporting changes to `{label}`."
+
+    def _worth_it(filename: str) -> str:
+        cat = folder_category(filename)
+        is_coupled = filename in coupled
+        if cat == "models":
+            return f"Ships the root contract — without this, nothing else can move."
+        if cat == "core":
+            if "validator" in filename.lower():
+                return (
+                    "Enforcement boundary — once this lands, bad strings can't reach the pipeline."
+                    + (" DORA: ship with Slice 1 (coupled)." if is_coupled else "")
+                )
+            return "Core logic update — makes the change visible at the processing stage."
+        if cat == "tests":
+            return "Shape Up: tests are the 1-day follow-on — ship in the next cycle if time is tight."
+        return "Low-risk supporting change."
+
+    non_readme = [f for f in files if folder_category(f) != "readme"]
+    readme_files = [f for f in files if folder_category(f) == "readme"]
+
+    # ── Dependency graph → connected components ───────────────────────────────
+    def _dep_graph(fs: List[str]) -> Dict[str, List[str]]:
+        stem_to_path = {os.path.splitext(os.path.basename(f))[0]: f for f in fs}
+        graph: Dict[str, List[str]] = {f: [] for f in fs}
+        for f in fs:
+            for line in snippets.get(f, "").splitlines():
+                m = re.search(r'(?:from|import)\s+([\w.]+)', line)
+                if not m:
+                    continue
+                for part in m.group(1).split('.'):
+                    if part in stem_to_path and stem_to_path[part] != f:
+                        nb = stem_to_path[part]
+                        if nb not in graph[f]:
+                            graph[f].append(nb)
+        return graph
+
+    def _find_components(fs: List[str], graph: Dict[str, List[str]]) -> List[List[str]]:
+        parent = {f: f for f in fs}
+
+        def find(x: str) -> str:
+            while parent[x] != x:
+                parent[x] = parent[parent[x]]
+                x = parent[x]
+            return x
+
+        for f, deps in graph.items():
+            for dep in deps:
+                px, py = find(f), find(dep)
+                if px != py:
+                    parent[px] = py
+
+        groups: Dict[str, List[str]] = {}
+        for f in fs:
+            groups.setdefault(find(f), []).append(f)
+        return list(groups.values())
+
+    def _component_priority(comp: List[str]) -> int:
+        order = {"models": 0, "core": 1, "tests": 2, "docs": 2, "config": 3, "other": 3}
+        return min(order.get(folder_category(f), 3) for f in comp)
+
+    def _component_title(comp: List[str]) -> str:
+        cats = {folder_category(f) for f in comp}
+        if "models" in cats:
+            return "Define the contract"
+        if "core" in cats:
+            return "Enforce it"
+        return "Prove it works"
+
+    dep_graph = _dep_graph(non_readme)
+    components = sorted(_find_components(non_readme, dep_graph), key=_component_priority)
+    slices = [(comp, i + 1) for i, comp in enumerate(components)]
+
+    def _slice_review(fs: List[str]) -> int:
+        return _review_minutes(len(fs), overall_risk, has_coupling=any(f in coupled for f in fs))
+
+    slice_lines = []
+    for files_in_slice, idx in slices:
+        review_t = _fmt_time(_slice_review(files_in_slice))
+        files_str = ", ".join(f"`{os.path.basename(f)}`" for f in files_in_slice)
+        bullets = "\n".join(f"   • {_slice_description(f)}" for f in files_in_slice)
+        worth = _worth_it(files_in_slice[0])
+        slice_lines.append(
+            f"*Slice {idx} — {_component_title(files_in_slice)}* | Est. review: {review_t} | Files: {files_str}\n"
+            f"{bullets}\n"
+            f"   _{worth}_"
+        )
+
+    # ── Smart move ────────────────────────────────────────────────────────────
+    s_mins = [_slice_review(comp) for comp, _ in slices]
+    first_slice = slices[0][0] if slices else []
+
+    if len(first_slice) > 1:
+        files_label = " + ".join(f"`{os.path.basename(f)}`" for f in first_slice)
+        smart_move = (
+            f"*Ship Slice 1 as a unit* ({files_label}) — "
+            f"these files import each other and cannot deploy independently. "
+            f"Est. review: {_fmt_time(s_mins[0])}."
+            + (f"\nSlices 2+ are independent — ship in order and verify in prod before the next." if len(slices) > 1 else "")
+        )
+    elif first_slice:
+        smart_move = (
+            f"*Start with Slice 1* (`{os.path.basename(first_slice[0])}`) — "
+            f"{_fmt_time(s_mins[0])} of review (DORA: smallest safe batch). "
+            f"Each slice is independent — ship in order and verify before the next."
+        )
+    else:
+        smart_move = "No slices to ship."
+
+    total_review = _fmt_time(_review_minutes(len(non_readme), overall_risk, bool(coupled)))
+    readme_note = f"\n\nUpdate README.md to reflect the `{subject}` change once slices land." if readme_files else ""
+
+    trigger_reason = "shipping risk" if token_count <= _BUDGET_THRESHOLD else "token budget"
+
+    say(
+        text=(
+            f"*Agent 3 — Risk Assessment* _(triggered by {trigger_reason})_\n\n"
+            f"Est. review: *{total_review}* | Tokens: *{token_count:,}* | Risk: *{overall_risk}*\n\n"
+            f"{risk_explanation}\n\n"
+            f"{knowledge_note}\n\n"
+            "*Verdict:* Too risky to ship as a single PR.\n\nThese are the recommended slices:\n\n"
+            + "\n\n".join(slice_lines)
+            + f"\n\n*Smart move:* {smart_move}"
+            + readme_note
+            + "\n\n*Reply to select:*\n"
+            "*go* — ship everything | *no go* — cancel | "
+            "*slice 1*, *slice 2*, *slice 1 2*, *slice 1 2 3* — pick specific slices"
+        ),
+        thread_ts=thread_ts,
+    )
+
+
+# ── Main pipeline ─────────────────────────────────────────────────────────────
+
+def _run_generator_and_pr(state: HackathonAppState) -> HackathonAppState:
+    """Run the generator node then create a PR. Returns updated state."""
+    state = pipeline.generator(state)
+    if state.policy_clearance and state.generated_code_blocks:
+        state.pull_request_url = _make_pr(state)
     return state
 
 
-def run_pipeline_until_generation(say, channel: str, thread_ts: str, user_message: str):
+def run_pipeline(say, channel: str, thread_ts: str, user_message: str) -> None:
     repo_path = resolve_repo_path(DEFAULT_TARGET_REPO)
     state = HackathonAppState(user_request=user_message, target_repo=repo_path)
 
-    state = mock_nodes.planner(state)
+    state = pipeline.planner(state)
     post_slices_identified(say, thread_ts, state)
 
-    state = mock_nodes.optimizer(state)
-    state = mock_nodes.estimator(state)
+    state = pipeline.optimizer(state)
+    state = pipeline.estimator(state)
     token_count = estimate_tokens(state.extracted_slice_context or state.user_request)
     post_cost_estimate(say, thread_ts, state, token_count)
 
-    if token_count > _BUDGET_THRESHOLD or not state.policy_clearance:
+    # Trigger go/no-go on financial threshold OR shipping risk (HIGH = coupled layers)
+    snippets: Dict[str, str] = {}
+    for chunk in (state.extracted_slice_context or "").split("\n# FILE: "):
+        if chunk.strip():
+            first_line, _, rest = chunk.partition("\n")
+            snippets[first_line.strip()] = rest
+
+    cost_triggered = token_count > _BUDGET_THRESHOLD or not state.policy_clearance
+    risk_triggered = _shipping_risk_triggered(state.affected_files, snippets)
+
+    if cost_triggered or risk_triggered:
         state.policy_clearance = False
         pending_budget_checks[(channel, thread_ts)] = state
         post_budget_check(say, thread_ts, token_count)
         return
 
-    state = mock_nodes.generator(state)
+    state = _run_generator_and_pr(state)
     post_generated_code(say, thread_ts, state)
 
+
+# ── Slack event handlers ──────────────────────────────────────────────────────
 
 @app.event("app_mention")
 def handle_app_mention(body, say, logger):
     event = body.get("event", {})
     channel = event.get("channel")
     thread_ts = event.get("thread_ts") or event.get("ts")
-    text = event.get("text", "")
+    user_message = extract_user_message(event.get("text", ""))
 
-    user_message = extract_user_message(text)
     if not user_message:
-        say(
-            text="I couldn't parse your request. Mention me with the text of your request.",
-            thread_ts=thread_ts,
-        )
+        say(text="Mention me with your change request and I'll get to work.", thread_ts=thread_ts)
         return
 
     say(text="Processing your request… 🔍", thread_ts=thread_ts)
     try:
-        run_pipeline_until_generation(say, channel, thread_ts, user_message)
+        run_pipeline(say, channel, thread_ts, user_message)
     except Exception as exc:
         logger.exception("Pipeline failed")
-        say(
-            text=f"Sorry, something went wrong.\nError: {exc}",
-            thread_ts=thread_ts,
-        )
+        say(text=f"Something went wrong.\nError: {exc}", thread_ts=thread_ts)
 
 
-@app.message(re.compile(r"^(go|no go|slice 1)$", re.IGNORECASE))
+@app.message(re.compile(r"^(go|no go|slice[\s\d]+)$", re.IGNORECASE))
 def handle_budget_reply(message, say, logger):
     if message.get("subtype") or message.get("bot_id"):
         return
@@ -495,77 +571,63 @@ def handle_budget_reply(message, say, logger):
     if not state:
         return
 
-    def folder_category(filename: str) -> str:
-        lower = filename.lower()
-        if "readme" in lower:
-            return "readme"
-        if "models/" in lower or "schema" in lower or "model" in lower:
-            return "models"
-        if "validators/" in lower or "validator" in lower or "services/" in lower or "pipeline" in lower:
-            return "core"
-        if "tests/" in lower or lower.startswith("test_") or "/test_" in lower:
-            return "tests"
-        if "docs/" in lower or lower.endswith(".md"):
-            return "docs"
-        if "config" in lower:
-            return "config"
-        return "other"
-
     try:
+        # ── go: run everything ────────────────────────────────────────────────
         if text == "go":
-            say(text="Proceeding despite the budget warning…", thread_ts=thread_ts)
+            say(text="Running full generation…", thread_ts=thread_ts)
             state.policy_clearance = True
-            state = mock_nodes.generator(state)
+            state = _run_generator_and_pr(state)
             post_generated_code(say, thread_ts, state)
             pending_budget_checks.pop(key, None)
             return
 
+        # ── no go: cancel ─────────────────────────────────────────────────────
         if text == "no go":
-            say(text="Cancelled. Feel free to refine your request and try again.", thread_ts=thread_ts)
+            say(text="Cancelled. Refine your request and try again.", thread_ts=thread_ts)
             pending_budget_checks.pop(key, None)
             return
 
-        slice_numbers = [int(c) for c in text if c.isdigit()]
-        if slice_numbers and all(1 <= n <= 3 for n in slice_numbers):
-            slice_1 = [f for f in state.affected_files if folder_category(f) == "models"]
-            slice_2 = [f for f in state.affected_files if folder_category(f) == "core"]
-            slice_3 = [f for f in state.affected_files if folder_category(f) in {"tests", "docs", "config", "other"}]
-            
-            selected_files = []
-            if 1 in slice_numbers:
-                selected_files.extend(slice_1)
-            if 2 in slice_numbers:
-                selected_files.extend(slice_2)
-            if 3 in slice_numbers:
-                selected_files.extend(slice_3)
-            
-            if not selected_files:
-                say(text="No files in those slices. Please try again.", thread_ts=thread_ts)
+        # ── slice N [N ...]: selective execution ──────────────────────────────
+        slice_numbers = sorted({int(c) for c in text if c.isdigit() and 1 <= int(c) <= 3})
+        if slice_numbers:
+            non_readme = [f for f in state.affected_files if folder_category(f) != "readme"]
+            s1 = [f for f in non_readme if folder_category(f) == "models"]
+            s2 = [f for f in non_readme if folder_category(f) == "core"]
+            s3 = [f for f in non_readme if folder_category(f) in ("tests", "docs", "config", "other")]
+
+            selected: List[str] = []
+            if 1 in slice_numbers: selected.extend(s1)
+            if 2 in slice_numbers: selected.extend(s2)
+            if 3 in slice_numbers: selected.extend(s3)
+
+            if not selected:
+                say(text="No files in those slices. Try different slice numbers.", thread_ts=thread_ts)
                 return
-            
-            say(text=f"Running slices {' + '.join(map(str, sorted(slice_numbers)))}…", thread_ts=thread_ts)
-            state.affected_files = selected_files
-            state = mock_nodes.optimizer(state)
-            state = mock_nodes.estimator(state)
-            token_count = estimate_tokens(state.extracted_slice_context or state.user_request)
-            
-            if token_count > _BUDGET_THRESHOLD and not state.policy_clearance:
-                state.policy_clearance = False
-                pending_budget_checks[key] = state
-                post_budget_check(say, thread_ts, token_count)
-                return
-            
-            state = mock_nodes.generator(state)
+
+            label = " + ".join(f"Slice {n}" for n in slice_numbers)
+            say(text=f"Running {label}…", thread_ts=thread_ts)
+
+            state.affected_files = selected
+            state.policy_clearance = True
+            state = _run_generator_and_pr(state)
             post_generated_code(say, thread_ts, state)
             pending_budget_checks.pop(key, None)
             return
 
-        say(text="Re-running the slicer with a smaller scope…", thread_ts=thread_ts)
-        state = reduce_slices(state)
-        post_slices_identified(say, thread_ts, state)
+        # ── fallback: re-slice smaller ────────────────────────────────────────
+        say(text="Re-slicing to a smaller scope…", thread_ts=thread_ts)
+        keywords = [w for w in re.findall(r"\w+", state.user_request) if len(w) > 3][:3]
+        if os.path.isdir(state.target_repo):
+            res = slice_repo(state.target_repo, keywords)
+            state.affected_files = res.get("affected_files", [])
+            state.extracted_slice_context = res.get("extracted_slice_context", "")
+        else:
+            state.affected_files = state.affected_files[:2]
+            state.extracted_slice_context = (state.extracted_slice_context or state.user_request)[:1500]
 
-        state = mock_nodes.optimizer(state)
-        state = mock_nodes.estimator(state)
+        post_slices_identified(say, thread_ts, state)
+        state = pipeline.optimizer(state)
+        state = pipeline.estimator(state)
         token_count = estimate_tokens(state.extracted_slice_context or state.user_request)
         post_cost_estimate(say, thread_ts, state, token_count)
 
@@ -575,17 +637,14 @@ def handle_budget_reply(message, say, logger):
             post_budget_check(say, thread_ts, token_count)
             return
 
-        state = mock_nodes.generator(state)
+        state = _run_generator_and_pr(state)
         post_generated_code(say, thread_ts, state)
         pending_budget_checks.pop(key, None)
+
     except Exception as exc:
-        logger.exception("Budget reply handler failed")
-        say(
-            text=f"Sorry, I couldn't complete the budget flow.\nError: {exc}",
-            thread_ts=thread_ts,
-        )
+        logger.exception("Budget reply failed")
+        say(text=f"Something went wrong.\nError: {exc}", thread_ts=thread_ts)
 
 
 if __name__ == "__main__":
-    handler = SocketModeHandler(app, SLACK_APP_TOKEN)
-    handler.start()
+    SocketModeHandler(app, SLACK_APP_TOKEN).start()

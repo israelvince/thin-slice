@@ -1,5 +1,8 @@
+import logging
 import os
 from typing import List
+
+logger = logging.getLogger("thin_slice.slicer")
 
 _SKIP_DIRS = {
     ".venv", "venv", ".env", "__pycache__", ".git",
@@ -41,7 +44,7 @@ def slice_repo(target_repo_path: str, keywords: List[str]) -> dict:
         return normalized
 
     keywords = normalize_keywords(keywords)
-    print(f"Slicer extracted keywords: {keywords}")
+    logger.debug("Slicer keywords: %s", keywords)
 
     affected = []
     snippets = []
@@ -65,18 +68,12 @@ def slice_repo(target_repo_path: str, keywords: List[str]) -> dict:
                     txt = fh.read()
                 txt_lower = txt.lower()
                 path_lower = rel.lower()
-                score = 0
-                
-                if keywords:
-                    for kw in keywords:
-                        if kw in path_lower:
-                            score += 2
-                        if kw in txt_lower:
-                            score += 1
-                
-                scored_files.append((rel, score, txt, txt_lower))
-                print(f"Slicer scoring {rel}: {score}")
-                
+                score = sum(
+                    (2 if kw in path_lower else 0) + (1 if kw in txt_lower else 0)
+                    for kw in keywords
+                )
+                scored_files.append((rel, score, txt))
+                logger.debug("Scored %s: %d", rel, score)
                 if score >= 2:
                     affected.append(rel)
                     snippets.append(f"# FILE: {rel}\n{txt[:_SNIPPET_CHARS]}")
@@ -84,11 +81,10 @@ def slice_repo(target_repo_path: str, keywords: List[str]) -> dict:
                 continue
 
     if not affected and scored_files:
-        sorted_files = sorted(scored_files, key=lambda x: x[1], reverse=True)
-        for rel, score, txt, txt_lower in sorted_files[:2]:
+        for rel, score, txt in sorted(scored_files, key=lambda x: -x[1])[:2]:
             affected.append(rel)
             snippets.append(f"# FILE: {rel}\n{txt[:_SNIPPET_CHARS]}")
-            print(f"Slicer fallback selected: {rel} (score={score})")
+            logger.debug("Fallback selected: %s (score=%d)", rel, score)
 
     return {
         "affected_files": affected,

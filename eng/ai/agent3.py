@@ -83,16 +83,31 @@ def structural_token_estimate(context: str, user_request: str) -> int:
 
 # ── Subject extraction ────────────────────────────────────────────────────────
 
+_ANNOTATION_WORDS = {"log", "logging", "print", "comment", "docstring", "debug", "trace"}
+
+
+def is_annotation_request(user_request: str) -> bool:
+    """Return True if the request is a simple annotation — log, comment, docstring, debug."""
+    return any(w in user_request.lower() for w in _ANNOTATION_WORDS)
+
+
 def extract_change_subject(user_request: str) -> Optional[str]:
     invalid_tokens = {"a", "the", "it"}
 
     def is_valid(candidate: str) -> bool:
         return len(candidate.strip().lower()) >= 5 and candidate.strip().lower() not in invalid_tokens
 
+    # ALL_CAPS constant with underscore (e.g. CHURN_RISK_THRESHOLD)
+    caps = [c for c in re.findall(r'\b[A-Z][A-Z0-9_]{4,}\b', user_request) if '_' in c and is_valid(c)]
+    if caps:
+        return caps[0]
+
+    # CamelCase identifier (e.g. RiskCategory)
     camel = [c for c in re.findall(r'\b[A-Z][a-z]+[A-Z][a-zA-Z]*\b', user_request) if is_valid(c)]
     if camel:
         return camel[0]
 
+    # snake_case field (e.g. risk_level)
     snake = [s for s in re.findall(r'\b[a-z]+_[a-z_]+\b', user_request) if is_valid(s)]
     if snake:
         return snake[0]

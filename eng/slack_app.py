@@ -209,12 +209,24 @@ def post_generated_code(say, thread_ts: str, state: HackathonAppState) -> None:
 
 # ── Agent 3 — Risk Assessment ─────────────────────────────────────────────────
 
+_ANNOTATION_WORDS = {"log", "logging", "print", "comment", "docstring", "debug", "trace"}
+
+
+def _is_annotation_request(user_request: str) -> bool:
+    return any(w in user_request.lower() for w in _ANNOTATION_WORDS)
+
+
 def _extract_change_subject(user_request: str) -> Optional[str]:
     invalid_tokens = {"a", "the", "it"}
 
     def is_valid_candidate(candidate: str) -> bool:
         normalized = candidate.strip().lower()
         return len(normalized) >= 5 and normalized not in invalid_tokens
+
+    # ALL_CAPS constant with underscore (e.g. CHURN_RISK_THRESHOLD)
+    caps = [c for c in re.findall(r'\b[A-Z][A-Z0-9_]{4,}\b', user_request) if '_' in c and is_valid_candidate(c)]
+    if caps:
+        return caps[0]
 
     camel = [c for c in re.findall(r'\b[A-Z][a-z]+[A-Z][a-zA-Z]*\b', user_request) if is_valid_candidate(c)]
     if camel:
@@ -354,7 +366,8 @@ def post_budget_check(say, thread_ts: str, token_count: int) -> None:
     )
 
     # ── Simple change fast-path: no slicing needed ───────────────────────────
-    if overall_risk == "LOW" and blast_radius == 0 and not coupled:
+    _annotation = _is_annotation_request(state.user_request)
+    if (overall_risk == "LOW" or _annotation) and blast_radius == 0 and not coupled:
         pending_slice_maps[thread_ts] = [non_readme]
         trigger_reason = "shipping risk" if token_count <= _BUDGET_THRESHOLD else "token budget"
         say(

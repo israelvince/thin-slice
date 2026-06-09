@@ -23,6 +23,29 @@ DEFAULT_TARGET_REPO = os.environ.get("SLACK_TARGET_REPO", "./demo_repo")
 
 _BUDGET_THRESHOLD = int(os.environ.get("THIN_SLICE_TOKEN_THRESHOLD", "1500"))
 
+_MINS_PER_FILE = {"HIGH": 30, "MEDIUM": 20, "LOW": 12}
+_COUPLING_OVERHEAD_MINS = 30
+
+
+def _review_minutes(file_count: int, risk: str, has_coupling: bool = False) -> int:
+    return file_count * _MINS_PER_FILE.get(risk, 20) + (_COUPLING_OVERHEAD_MINS if has_coupling else 0)
+
+
+def _fmt_time(minutes: int) -> str:
+    if minutes < 60:
+        return f"~{minutes} min"
+    return f"~{minutes / 60:.1f} hr"
+
+
+def _blast_radius_score(files: List[str], graph: Dict[str, List[str]]) -> int:
+    return sum(1 for f in files for deps in graph.values() if f in deps)
+
+
+def _structural_token_estimate(context: str, user_request: str) -> int:
+    ctx_tokens = estimate_tokens(context)
+    req_tokens = estimate_tokens(user_request)
+    return int((ctx_tokens + req_tokens + 500) * 1.4)
+
 
 if not SLACK_BOT_TOKEN or not SLACK_APP_TOKEN:
     raise RuntimeError(

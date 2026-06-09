@@ -74,17 +74,17 @@ def slice_repo(target_repo_path: str, keywords: List[str]) -> dict:
                 )
                 scored_files.append((rel, score, txt))
                 logger.debug("Scored %s: %d", rel, score)
-                if score >= 2:
+                if score >= 4:
                     affected.append(rel)
                     snippets.append(f"# FILE: {rel}\n{txt[:_SNIPPET_CHARS]}")
             except Exception:
                 continue
 
     if not affected and scored_files:
-        for rel, score, txt in sorted(scored_files, key=lambda x: -x[1])[:2]:
-            affected.append(rel)
-            snippets.append(f"# FILE: {rel}\n{txt[:_SNIPPET_CHARS]}")
-            logger.debug("Fallback selected: %s (score=%d)", rel, score)
+        rel, score, txt = max(scored_files, key=lambda x: x[1])
+        affected.append(rel)
+        snippets.append(f"# FILE: {rel}\n{txt[:_SNIPPET_CHARS]}")
+        logger.debug("Fallback selected: %s (score=%d)", rel, score)
 
     return {
         "affected_files": affected,

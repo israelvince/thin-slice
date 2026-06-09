@@ -36,6 +36,19 @@ def _fmt_time(minutes: int) -> str:
         return f"~{minutes} min"
     return f"~{minutes / 60:.1f} hr"
 
+
+def _blast_radius_score(files: List[str], graph: Dict[str, List[str]]) -> int:
+    """Total inbound dependency count — how many changed files are depended on by others."""
+    return sum(1 for f in files for deps in graph.values() if f in deps)
+
+
+def _structural_token_estimate(context: str, user_request: str) -> int:
+    """Tokens the model will actually consume: context + request + system overhead + estimated output."""
+    ctx_tokens = estimate_tokens(context)
+    req_tokens = estimate_tokens(user_request)
+    return int((ctx_tokens + req_tokens + 500) * 1.4)
+
+
 if not SLACK_BOT_TOKEN or not SLACK_APP_TOKEN:
     raise RuntimeError(
         "SLACK_BOT_TOKEN and SLACK_APP_TOKEN must be set before starting the Slack app."
@@ -43,6 +56,8 @@ if not SLACK_BOT_TOKEN or not SLACK_APP_TOKEN:
 
 app = App(token=SLACK_BOT_TOKEN)
 pending_budget_checks: Dict[Tuple[str, str], HackathonAppState] = {}
+pending_slice_maps: Dict[str, List[List[str]]] = {}  # thread_ts -> vertical slice file lists
+
 
 # ── Knowledge context (loaded once at startup) ────────────────────────────────
 
@@ -63,6 +78,7 @@ def _load_knowledge() -> Dict[str, str]:
     return out
 
 _KNOWLEDGE = _load_knowledge()
+
 
 # ── Shared helpers ────────────────────────────────────────────────────────────
 
@@ -122,11 +138,6 @@ def format_code_blocks(generated: dict) -> str:
 # ── PR creation ───────────────────────────────────────────────────────────────
 
 def _make_pr(state: HackathonAppState) -> Optional[str]:
-    """
-    Create a PR for the generated changes.
-    Finds the git repo root, prefixes change paths correctly,
-    then delegates to create_pr_stub (gh CLI → local stub).
-    """
     if not state.generated_code_blocks:
         return None
     try:
@@ -198,24 +209,31 @@ def post_generated_code(say, thread_ts: str, state: HackathonAppState) -> None:
     )
 
 
-# ── Agent 3 — Cost × Risk Assessment ─────────────────────────────────────────
+# ── Agent 3 — Risk Assessment ─────────────────────────────────────────────────
 
-def _extract_change_subject(user_request: str) -> str:
-    """Pull the key entity being changed out of the request string."""
-    # CamelCase identifier (e.g. RiskCategory)
-    camel = re.findall(r'\b[A-Z][a-z]+[A-Z][a-zA-Z]*\b', user_request)
+def _extract_change_subject(user_request: str) -> Optional[str]:
+    invalid_tokens = {"a", "the", "it"}
+
+    def is_valid_candidate(candidate: str) -> bool:
+        normalized = candidate.strip().lower()
+        return len(normalized) >= 5 and normalized not in invalid_tokens
+
+    camel = [c for c in re.findall(r'\b[A-Z][a-z]+[A-Z][a-zA-Z]*\b', user_request) if is_valid_candidate(c)]
     if camel:
         return camel[0]
-    # snake_case field (e.g. risk_level)
-    snake = re.findall(r'\b[a-z]+_[a-z_]+\b', user_request)
+
+    snake = [s for s in re.findall(r'\b[a-z]+_[a-z_]+\b', user_request) if is_valid_candidate(s)]
     if snake:
         return snake[0]
-    # Fallback: first substantial noun after a verb
+
     for verb in ("replace", "add", "migrate", "refactor", "update", "introduce"):
         m = re.search(rf'{verb}\s+(\w+)', user_request, re.I)
         if m:
-            return m.group(1)
-    return "the change"
+            candidate = m.group(1)
+            if is_valid_candidate(candidate):
+                return candidate
+
+    return None
 
 
 def _compute_risk(files: List[str], snippets: Dict[str, str]) -> tuple:
@@ -229,7 +247,6 @@ def _compute_risk(files: List[str], snippets: Dict[str, str]) -> tuple:
         if "test" not in f.lower()
         and not re.search(r"\b(def test_|pytest|unittest|class Test)", snippets.get(f, ""), re.I)
     )
-    # Coupling: model + core files that reference the same field are coupled
     coupled = (
         [f for f in files if folder_category(f) in ("models", "core")]
         if folder_counts["models"] > 0 and folder_counts["core"] > 0
@@ -245,7 +262,6 @@ def _compute_risk(files: List[str], snippets: Dict[str, str]) -> tuple:
 
 
 def _shipping_risk_triggered(files: List[str], snippets: Dict[str, str]) -> bool:
-    """Return True when shipping risk alone justifies the go/no-go gate."""
     overall_risk, _, _, _, _ = _compute_risk(files, snippets)
     return overall_risk == "HIGH"
 
@@ -268,6 +284,7 @@ def post_budget_check(say, thread_ts: str, token_count: int) -> None:
         return
 
     files = state.affected_files or []
+
     # ── Parse snippets ────────────────────────────────────────────────────────
     snippets: Dict[str, str] = {}
     for chunk in (state.extracted_slice_context or "").split("\n# FILE: "):
@@ -276,17 +293,41 @@ def post_budget_check(say, thread_ts: str, token_count: int) -> None:
         first_line, _, rest = chunk.partition("\n")
         snippets[first_line.strip()] = rest
 
+    # ── Dependency graph (used for blast radius + vertical grouping) ──────────
+    def _dep_graph(fs: List[str]) -> Dict[str, List[str]]:
+        stem_to_path = {os.path.splitext(os.path.basename(f))[0]: f for f in fs}
+        graph: Dict[str, List[str]] = {f: [] for f in fs}
+        for f in fs:
+            for line in snippets.get(f, "").splitlines():
+                m = re.search(r'(?:from|import)\s+([\w.]+)', line)
+                if not m:
+                    continue
+                for part in m.group(1).split('.'):
+                    if part in stem_to_path and stem_to_path[part] != f:
+                        nb = stem_to_path[part]
+                        if nb not in graph[f]:
+                            graph[f].append(nb)
+        return graph
+
+    non_readme = [f for f in files if folder_category(f) != "readme"]
+    readme_files = [f for f in files if folder_category(f) == "readme"]
+
+    dep_graph = _dep_graph(non_readme)
+    blast_radius = _blast_radius_score(non_readme, dep_graph)
+    blast_label = "HIGH" if blast_radius >= 4 else "MEDIUM" if blast_radius >= 2 else "LOW"
+
     overall_risk, _, folder_counts, no_test_count, coupled = _compute_risk(files, snippets)
     subject = _extract_change_subject(state.user_request)
+    subject_label = subject or "the change"
 
-    # ── Risk explanation — specific, not templated ────────────────────────────
+    # ── Risk explanation ──────────────────────────────────────────────────────
     layers_hit = [
         label for label, cat in (("schema layer", "models"), ("logic/validation layer", "core"))
         if folder_counts[cat] > 0
     ]
     layers_phrase = " and ".join(layers_hit) or "feature-critical files"
 
-    if coupled:
+    if coupled and subject:
         coupling_warning = (
             f"*Coupling detected:* `{os.path.basename(coupled[0])}` defines `{subject}` "
             f"and {len(coupled) - 1} file(s) consume it — they cannot deploy independently. "
@@ -302,13 +343,19 @@ def post_budget_check(say, thread_ts: str, token_count: int) -> None:
         if no_test_count > 0 else ""
     )
 
+    blast_note = (
+        f"Blast radius: *{blast_label}* — {blast_radius} file(s) are downstream dependencies of this change."
+        if blast_radius > 0 else ""
+    )
+
     risk_explanation = (
         f"This touches {len(files)} files across the {layers_phrase}. "
         + (f"{coverage_note} " if coverage_note else "")
+        + (f"\n{blast_note}" if blast_note else "")
         + (f"\n{coupling_warning}" if coupling_warning else "")
     )
 
-    # ── Knowledge applied to THIS change ─────────────────────────────────────
+    # ── Knowledge note ────────────────────────────────────────────────────────
     if overall_risk == "HIGH" and coupled:
         knowledge_note = (
             f"_DORA says batch size is the strongest predictor of stability — "
@@ -328,164 +375,156 @@ def post_budget_check(say, thread_ts: str, token_count: int) -> None:
             f"verify that before shipping._"
         )
 
-    # ── Build slices ──────────────────────────────────────────────────────────
-    def _clean_label(filename: str) -> str:
-        return os.path.splitext(os.path.basename(filename))[0].replace("_", " ").replace("-", " ")
+    # ── Semantic slice title detection ────────────────────────────────────────
+    def _detect_fields(request: str) -> List[str]:
+        candidates = [
+            "customer", "order", "payment", "product", "address", "profile",
+            "transaction", "shipment", "review", "inventory", "rating",
+        ]
+        return [term for term in candidates if re.search(rf"\b{term}s?\b", request)]
 
-    def _slice_description(filename: str) -> str:
-        cat = folder_category(filename)
-        label = _clean_label(filename)
-        is_coupled = filename in coupled
-        base = os.path.basename(filename)
+    def _detect_stages(request: str) -> List[str]:
+        stage_map = [
+            ("extract", "read"), ("ingest", "read"), ("load", "export"),
+            ("transform", "process"), ("process", "process"), ("validate", "validate"),
+            ("export", "export"), ("score", "process"), ("enrich", "process"),
+        ]
+        stages: List[str] = []
+        for term, label in stage_map:
+            if term in request and label not in stages:
+                stages.append(label)
+        return stages
 
-        if cat == "models":
-            return (
-                f"Introduce `{subject}` in `{base}` — the root contract. "
-                f"This is what {len([f for f in files if folder_category(f) == 'core'])} "
-                f"downstream file(s) will import from instead of maintaining their own copy."
-            )
-        if cat == "core":
-            if "validator" in filename.lower():
-                coupling_flag = " *Must ship with Slice 1* — validation breaks without the model." if is_coupled else ""
-                return (
-                    f"`{base}` currently checks `{subject}` as a raw string. "
-                    f"Replace the inline set literal with a type-level check against `{subject}`.{coupling_flag}"
-                )
-            return (
-                f"`{base}` references `{subject}` — update it to use the new contract "
-                f"from the model layer instead of its own copy."
-                + (" *Coupled to Slice 1.*" if is_coupled else "")
-            )
-        if cat == "tests":
-            return (
-                f"Update `{base}` to exercise `{subject}` — confirms the enum "
-                f"validates correctly and the classifier returns the right category."
-            )
-        if cat == "readme":
-            return f"Document the `{subject}` change in README — update the domain model table."
-        return f"Apply supporting changes to `{label}`."
+    def _detect_personas(request: str) -> List[str]:
+        candidates = ["customer", "admin", "merchant", "manager", "analyst", "support", "operator"]
+        return [term for term in candidates if re.search(rf"\b{term}s?\b", request)]
 
-    def _worth_it(filename: str) -> str:
-        cat = folder_category(filename)
-        is_coupled = filename in coupled
-        if cat == "models":
-            return f"Ships the root contract — without this, nothing else can move."
-        if cat == "core":
-            if "validator" in filename.lower():
-                return (
-                    "Enforcement boundary — once this lands, bad strings can't reach the pipeline."
-                    + (" DORA: ship with Slice 1 (coupled)." if is_coupled else "")
-                )
-            return "Core logic update — makes the change visible at the processing stage."
-        if cat == "tests":
-            return "Shape Up: tests are the 1-day follow-on — ship in the next cycle if time is tight."
-        return "Low-risk supporting change."
+    def _slice_titles(request: str) -> List[str]:
+        req = request.lower()
+        if any(w in req for w in ["error handling", "edge case", "missing data", "missing values", "invalid", "exception", "gracefully", "default"]):
+            return [
+                f"Happy path: {subject_label} works for complete data",
+                "Edge case: incomplete or missing data handled gracefully",
+                "Sad path: invalid input fails safely before downstream processing",
+            ]
+        fields = _detect_fields(req)
+        if len(fields) > 1:
+            return [f"Data type: {field} handled end-to-end" for field in fields[:3]]
+        stages = _detect_stages(req)
+        if len(stages) > 1:
+            return [f"Workflow step: {stage} stage delivers a complete handoff" for stage in stages[:3]]
+        personas = _detect_personas(req)
+        if len(personas) > 1:
+            return [f"Persona: {persona.capitalize()} experience completes with feedback" for persona in personas[:3]]
+        return [
+            "Read stage: ingest and normalize source data",
+            "Process stage: compute business-ready values",
+            "Validate stage: enforce quality and constraints",
+            "Export stage: deliver output for consumers",
+        ]
 
-    non_readme = [f for f in files if folder_category(f) != "readme"]
-    readme_files = [f for f in files if folder_category(f) == "readme"]
+    def _group_vertical_slices(
+        titles: List[str], all_files: List[str], graph: Dict[str, List[str]]
+    ) -> List[Tuple[str, List[str]]]:
+        category_bins: Dict[str, List[str]] = {
+            cat: [f for f in all_files if folder_category(f) == cat]
+            for cat in ("models", "core", "tests", "other")
+        }
+        slices: List[Tuple[str, List[str]]] = []
 
-    # ── Dependency graph → connected components ───────────────────────────────
-    def _dep_graph(fs: List[str]) -> Dict[str, List[str]]:
-        stem_to_path = {os.path.splitext(os.path.basename(f))[0]: f for f in fs}
-        graph: Dict[str, List[str]] = {f: [] for f in fs}
+        for title in titles:
+            grouped: List[str] = []
+            for cat in ("models", "core", "tests"):
+                if category_bins[cat]:
+                    grouped.append(category_bins[cat].pop(0))
+            if not grouped and category_bins["other"]:
+                grouped.append(category_bins["other"].pop(0))
+
+            # Pull in required dependencies that haven't been assigned yet
+            to_add: List[str] = []
+            for f in grouped:
+                for dep in graph.get(f, []):
+                    if dep not in grouped and dep not in to_add:
+                        for cat in category_bins:
+                            if dep in category_bins[cat]:
+                                category_bins[cat].remove(dep)
+                                to_add.append(dep)
+            grouped.extend(to_add)
+            slices.append((title, grouped))
+
+        leftovers = [f for cat_files in category_bins.values() for f in cat_files]
+        while leftovers:
+            chunk: List[str] = []
+            while leftovers and len(chunk) < 3:
+                chunk.append(leftovers.pop(0))
+            slices.append(("Supporting slice: additional related outcome", chunk))
+
+        return [s for s in slices if s[1]]
+
+    def _estimate_lines(fs: List[str]) -> int:
+        count = 0
         for f in fs:
-            for line in snippets.get(f, "").splitlines():
-                m = re.search(r'(?:from|import)\s+([\w.]+)', line)
-                if not m:
-                    continue
-                for part in m.group(1).split('.'):
-                    if part in stem_to_path and stem_to_path[part] != f:
-                        nb = stem_to_path[part]
-                        if nb not in graph[f]:
-                            graph[f].append(nb)
-        return graph
+            snippet = snippets.get(f, "")
+            count += snippet.count("\n") + 1 if snippet else 10
+        return min(max(count, 5), 150)
 
-    def _find_components(fs: List[str], graph: Dict[str, List[str]]) -> List[List[str]]:
-        parent = {f: f for f in fs}
+    def _slice_outcome(title: str) -> str:
+        if title.startswith("Happy path"):
+            return f"A complete {subject_label} flow works for full records — verifiable with one happy-path scenario."
+        if title.startswith("Edge case"):
+            return "Incomplete or missing values are handled without crashing and the outcome is observable."
+        if title.startswith("Sad path"):
+            return "Invalid inputs are rejected before reaching downstream processing."
+        if title.startswith("Data type"):
+            return "One key data category is processed end-to-end and can be validated by focused tests."
+        if title.startswith("Workflow step"):
+            return "This stage ships a complete handoff — testable in isolation against upstream and downstream expectations."
+        if title.startswith("Persona"):
+            return "One user persona sees a completed experience and can validate through their own workflow."
+        return "Delivers a specific business-facing outcome that can be validated with a focused test."
 
-        def find(x: str) -> str:
-            while parent[x] != x:
-                parent[x] = parent[parent[x]]
-                x = parent[x]
-            return x
-
-        for f, deps in graph.items():
-            for dep in deps:
-                px, py = find(f), find(dep)
-                if px != py:
-                    parent[px] = py
-
-        groups: Dict[str, List[str]] = {}
-        for f in fs:
-            groups.setdefault(find(f), []).append(f)
-        return list(groups.values())
-
-    def _component_priority(comp: List[str]) -> int:
-        order = {"models": 0, "core": 1, "tests": 2, "docs": 2, "config": 3, "other": 3}
-        return min(order.get(folder_category(f), 3) for f in comp)
-
-    def _component_title(comp: List[str]) -> str:
-        cats = {folder_category(f) for f in comp}
-        if "models" in cats:
-            return "Define the contract"
-        if "core" in cats:
-            return "Enforce it"
-        return "Prove it works"
-
-    dep_graph = _dep_graph(non_readme)
-    components = sorted(_find_components(non_readme, dep_graph), key=_component_priority)
-    slices = [(comp, i + 1) for i, comp in enumerate(components)]
+    def _slice_invest(fs: List[str], graph: Dict[str, List[str]], other_files: set) -> str:
+        depends_on_other = any(dep in other_files for f in fs for dep in graph.get(f, []))
+        if not depends_on_other and len(fs) <= 3 and _estimate_lines(fs) <= 150:
+            return "Independent | Valuable | Testable in isolation"
+        return "Depends on Slice 1 shipping first — not fully independent"
 
     def _slice_review(fs: List[str]) -> int:
         return _review_minutes(len(fs), overall_risk, has_coupling=any(f in coupled for f in fs))
 
-    slice_lines = []
-    for files_in_slice, idx in slices:
-        review_t = _fmt_time(_slice_review(files_in_slice))
-        files_str = ", ".join(f"`{os.path.basename(f)}`" for f in files_in_slice)
-        bullets = "\n".join(f"   • {_slice_description(f)}" for f in files_in_slice)
-        worth = _worth_it(files_in_slice[0])
-        slice_lines.append(
-            f"*Slice {idx} — {_component_title(files_in_slice)}* | Est. review: {review_t} | Files: {files_str}\n"
-            f"{bullets}\n"
-            f"   _{worth}_"
-        )
+    slice_titles = _slice_titles(state.user_request)
+    slices = _group_vertical_slices(slice_titles, non_readme, dep_graph)
 
-    # ── Smart move ────────────────────────────────────────────────────────────
-    s_mins = [_slice_review(comp) for comp, _ in slices]
-    first_slice = slices[0][0] if slices else []
-
-    if len(first_slice) > 1:
-        files_label = " + ".join(f"`{os.path.basename(f)}`" for f in first_slice)
-        smart_move = (
-            f"*Ship Slice 1 as a unit* ({files_label}) — "
-            f"these files import each other and cannot deploy independently. "
-            f"Est. review: {_fmt_time(s_mins[0])}."
-            + (f"\nSlices 2+ are independent — ship in order and verify in prod before the next." if len(slices) > 1 else "")
-        )
-    elif first_slice:
-        smart_move = (
-            f"*Start with Slice 1* (`{os.path.basename(first_slice[0])}`) — "
-            f"{_fmt_time(s_mins[0])} of review (DORA: smallest safe batch). "
-            f"Each slice is independent — ship in order and verify before the next."
-        )
-    else:
-        smart_move = "No slices to ship."
+    # Store for handle_budget_reply so slice N maps to the correct files
+    pending_slice_maps[thread_ts] = [files_in_slice for _, files_in_slice in slices]
 
     total_review = _fmt_time(_review_minutes(len(non_readme), overall_risk, bool(coupled)))
-    readme_note = f"\n\nUpdate README.md to reflect the `{subject}` change once slices land." if readme_files else ""
-
+    readme_note = f"\n\nUpdate README.md to reflect the `{subject_label}` change once slices land." if readme_files else ""
     trigger_reason = "shipping risk" if token_count <= _BUDGET_THRESHOLD else "token budget"
+
+    slice_lines: List[str] = []
+    for idx, (title, files_in_slice) in enumerate(slices, start=1):
+        files_str = ", ".join(f"`{os.path.basename(f)}`" for f in files_in_slice)
+        other_files = {f for j, (_, sf) in enumerate(slices) if j != idx - 1 for f in sf}
+        invest_text = _slice_invest(files_in_slice, dep_graph, other_files)
+        change_size = _estimate_lines(files_in_slice)
+        review_t = _fmt_time(_slice_review(files_in_slice))
+        slice_lines.append(
+            f"*Slice {idx} — {title}*\n"
+            f"Files: {files_str}\n"
+            f"What ships: {_slice_outcome(title)}\n"
+            f"{invest_text} | Est. review: {review_t} | ~{change_size} lines changed"
+        )
 
     say(
         text=(
             f"*Agent 3 — Risk Assessment* _(triggered by {trigger_reason})_\n\n"
-            f"Est. review: *{total_review}* | Tokens: *{token_count:,}* | Risk: *{overall_risk}*\n\n"
+            f"Est. review: *{total_review}* | Tokens: *{token_count:,}* | Risk: *{overall_risk}* | Blast radius: *{blast_label}*\n\n"
             f"{risk_explanation}\n\n"
             f"{knowledge_note}\n\n"
             "*Verdict:* Too risky to ship as a single PR.\n\nThese are the recommended slices:\n\n"
             + "\n\n".join(slice_lines)
-            + f"\n\n*Smart move:* {smart_move}"
+            + "\n\n*Smart move:* Ship Slice 1 first — get feedback before deciding if the rest is still needed."
             + readme_note
             + "\n\n*Reply to select:*\n"
             "*go* — ship everything | *no go* — cancel | "
@@ -498,7 +537,6 @@ def post_budget_check(say, thread_ts: str, token_count: int) -> None:
 # ── Main pipeline ─────────────────────────────────────────────────────────────
 
 def _run_generator_and_pr(state: HackathonAppState) -> HackathonAppState:
-    """Run the generator node then create a PR. Returns updated state."""
     state = pipeline.generator(state)
     if state.policy_clearance and state.generated_code_blocks:
         state.pull_request_url = _make_pr(state)
@@ -514,10 +552,13 @@ def run_pipeline(say, channel: str, thread_ts: str, user_message: str) -> None:
 
     state = pipeline.optimizer(state)
     state = pipeline.estimator(state)
-    token_count = estimate_tokens(state.extracted_slice_context or state.user_request)
+
+    # Structural estimate: actual context + request + system overhead + output
+    token_count = _structural_token_estimate(
+        state.extracted_slice_context or "", state.user_request
+    )
     post_cost_estimate(say, thread_ts, state, token_count)
 
-    # Trigger go/no-go on financial threshold OR shipping risk (HIGH = coupled layers)
     snippets: Dict[str, str] = {}
     for chunk in (state.extracted_slice_context or "").split("\n# FILE: "):
         if chunk.strip():
@@ -550,7 +591,7 @@ def handle_app_mention(body, say, logger):
         say(text="Mention me with your change request and I'll get to work.", thread_ts=thread_ts)
         return
 
-    say(text="Processing your request… 🔍", thread_ts=thread_ts)
+    say(text="Processing your request…", thread_ts=thread_ts)
     try:
         run_pipeline(say, channel, thread_ts, user_message)
     except Exception as exc:
@@ -579,26 +620,24 @@ def handle_budget_reply(message, say, logger):
             state = _run_generator_and_pr(state)
             post_generated_code(say, thread_ts, state)
             pending_budget_checks.pop(key, None)
+            pending_slice_maps.pop(thread_ts, None)
             return
 
         # ── no go: cancel ─────────────────────────────────────────────────────
         if text == "no go":
             say(text="Cancelled. Refine your request and try again.", thread_ts=thread_ts)
             pending_budget_checks.pop(key, None)
+            pending_slice_maps.pop(thread_ts, None)
             return
 
-        # ── slice N [N ...]: selective execution ──────────────────────────────
-        slice_numbers = sorted({int(c) for c in text if c.isdigit() and 1 <= int(c) <= 3})
+        # ── slice N [N ...]: use the vertical slices computed in Agent 3 ──────
+        slice_numbers = sorted({int(c) for c in text if c.isdigit() and 1 <= int(c) <= 9})
         if slice_numbers:
-            non_readme = [f for f in state.affected_files if folder_category(f) != "readme"]
-            s1 = [f for f in non_readme if folder_category(f) == "models"]
-            s2 = [f for f in non_readme if folder_category(f) == "core"]
-            s3 = [f for f in non_readme if folder_category(f) in ("tests", "docs", "config", "other")]
-
+            slice_map = pending_slice_maps.get(thread_ts, [])
             selected: List[str] = []
-            if 1 in slice_numbers: selected.extend(s1)
-            if 2 in slice_numbers: selected.extend(s2)
-            if 3 in slice_numbers: selected.extend(s3)
+            for n in slice_numbers:
+                if 1 <= n <= len(slice_map):
+                    selected.extend(slice_map[n - 1])
 
             if not selected:
                 say(text="No files in those slices. Try different slice numbers.", thread_ts=thread_ts)
@@ -612,6 +651,7 @@ def handle_budget_reply(message, say, logger):
             state = _run_generator_and_pr(state)
             post_generated_code(say, thread_ts, state)
             pending_budget_checks.pop(key, None)
+            pending_slice_maps.pop(thread_ts, None)
             return
 
         # ── fallback: re-slice smaller ────────────────────────────────────────
@@ -628,8 +668,16 @@ def handle_budget_reply(message, say, logger):
         post_slices_identified(say, thread_ts, state)
         state = pipeline.optimizer(state)
         state = pipeline.estimator(state)
-        token_count = estimate_tokens(state.extracted_slice_context or state.user_request)
+        token_count = _structural_token_estimate(
+            state.extracted_slice_context or "", state.user_request
+        )
         post_cost_estimate(say, thread_ts, state, token_count)
+
+        snippets: Dict[str, str] = {}
+        for chunk in (state.extracted_slice_context or "").split("\n# FILE: "):
+            if chunk.strip():
+                first_line, _, rest = chunk.partition("\n")
+                snippets[first_line.strip()] = rest
 
         if token_count > _BUDGET_THRESHOLD or not state.policy_clearance:
             state.policy_clearance = False
@@ -640,6 +688,7 @@ def handle_budget_reply(message, say, logger):
         state = _run_generator_and_pr(state)
         post_generated_code(say, thread_ts, state)
         pending_budget_checks.pop(key, None)
+        pending_slice_maps.pop(thread_ts, None)
 
     except Exception as exc:
         logger.exception("Budget reply failed")

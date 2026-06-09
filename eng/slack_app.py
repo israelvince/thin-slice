@@ -355,6 +355,26 @@ def post_budget_check(say, thread_ts: str, token_count: int) -> None:
         + (f"\n{coupling_warning}" if coupling_warning else "")
     )
 
+    # ── Simple change fast-path: no slicing needed ───────────────────────────
+    if overall_risk == "LOW" and blast_radius == 0 and not coupled:
+        pending_slice_maps[thread_ts] = [non_readme]
+        trigger_reason = "shipping risk" if token_count <= _BUDGET_THRESHOLD else "token budget"
+        say(
+            text=(
+                f"*Agent 3 — Risk Assessment* _(triggered by {trigger_reason})_\n\n"
+                f"Est. review: *{_fmt_time(_review_minutes(len(non_readme), overall_risk, False))}* "
+                f"| Tokens: *{token_count:,}* | Risk: *{overall_risk}*\n\n"
+                f"{risk_explanation}\n\n"
+                "_Shape Up: this change is atomic and self-contained — it ships in one go and can be "
+                "verified in isolation. No slicing needed._\n\n"
+                "*Verdict:* Safe to ship as-is.\n\n"
+                "*Reply to select:*\n"
+                "*go* — ship it | *no go* — cancel"
+            ),
+            thread_ts=thread_ts,
+        )
+        return
+
     # ── Knowledge note ────────────────────────────────────────────────────────
     if overall_risk == "HIGH" and coupled:
         knowledge_note = (
@@ -374,6 +394,19 @@ def post_budget_check(say, thread_ts: str, token_count: int) -> None:
             f"_Strangler Fig: each slice must work independently and be reversible — "
             f"verify that before shipping._"
         )
+
+    # ── Value label from code (reads docstrings/comments Pilar added) ────────
+    def _file_value_label(filename: str) -> str:
+        snippet = snippets.get(filename, "")
+        for line in snippet.splitlines()[:30]:
+            s = line.strip()
+            if (s.startswith('"""') or s.startswith("'''")) and len(s) > 6:
+                desc = s.strip('"\'').strip()
+                if len(desc) > 10:
+                    return desc
+            if s.startswith('#') and len(s) > 15 and not s.startswith('#!'):
+                return s.lstrip('# ').strip()
+        return os.path.splitext(os.path.basename(filename))[0].replace('_', ' ').replace('-', ' ')
 
     # ── Semantic slice title detection ────────────────────────────────────────
     def _detect_fields(request: str) -> List[str]:
@@ -416,12 +449,18 @@ def post_budget_check(say, thread_ts: str, token_count: int) -> None:
         personas = _detect_personas(req)
         if len(personas) > 1:
             return [f"Persona: {persona.capitalize()} experience completes with feedback" for persona in personas[:3]]
-        return [
-            "Read stage: ingest and normalize source data",
-            "Process stage: compute business-ready values",
-            "Validate stage: enforce quality and constraints",
-            "Export stage: deliver output for consumers",
-        ]
+
+        # Fallback: derive titles from what the changed files actually describe
+        non_test_files = [f for f in non_readme if folder_category(f) not in ("tests", "readme")]
+        value_labels = list(dict.fromkeys(_file_value_label(f) for f in non_test_files))
+        if len(value_labels) >= 2:
+            return [f"{label} complete and verifiable" for label in value_labels[:3]]
+        if len(value_labels) == 1:
+            return [
+                f"{value_labels[0]} works for the happy path",
+                f"{value_labels[0]} handles edge cases safely",
+            ]
+        return ["Core change ships atomically and can be verified end-to-end"]
 
     def _group_vertical_slices(
         titles: List[str], all_files: List[str], graph: Dict[str, List[str]]

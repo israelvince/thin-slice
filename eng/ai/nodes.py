@@ -108,12 +108,30 @@ def _build_changes(state: HackathonAppState) -> dict:
         logger.info("Generator: LLM produced output for %s", target)
         return {target: llm_output}
 
-    # Mock fallback: CLTV demo only when running against the sandbox_repo directory.
-    # For any other target (demo_repo, tails, etc.) fall through to generic changes.
+    # No LLM available — use smart rule-based generation
     import os as _os
     repo_name = _os.path.basename(_os.path.abspath(state.target_repo))
     if repo_name == "sandbox_repo":
         return _cltv_changes()
+
+    # Parse snippets for smart generator
+    from .services.demo_generator import generate as smart_generate
+    snippets: dict = {}
+    for chunk in ("\n" + (state.extracted_slice_context or "")).split("\n# FILE: "):
+        if not chunk.strip():
+            continue
+        first_line, _, rest = chunk.partition("\n")
+        snippets[first_line.strip()] = rest
+
+    result = smart_generate(
+        state.user_request,
+        state.affected_files or [],
+        snippets,
+        state.target_repo,
+    )
+    if result:
+        logger.info("Generator: smart fallback produced %d file(s)", len(result))
+        return result
     return _generic_changes(state)
 
 

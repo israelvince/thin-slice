@@ -1,22 +1,19 @@
-# Thin-Slice (demo)
+# Thin-Slice
 
-This repository contains a compact hackathon demo implementing "Sliced Regen + Cost Guardrails" — a small pipeline that shows how to slice a change request, estimate LLM token cost, generate code, and enforce runtime token cost guardrails.
+A Slack-native AI pipeline that intercepts code change requests, assesses shipping risk using DORA and Shape Up principles, and breaks large changes into safe, independently verifiable slices before generating code.
 
-Important: the interactive demo and runnable code live in the `eng/` folder. Open that folder for full details, examples, and the developer README.
+Built for the AI/works hackathon — June 2026.
 
-Quick links
-- `eng/README.md` — Full, in-depth project README (how to run, test, what's done, and what's left).
-- `eng/runner.py` — Entrypoint used for the demo orchestration (mock mode available).
-- `eng/ai/` — Pipeline source: planner, optimizer, estimator, generator, and the TokenBudgetTracker (Agent 5).
-- `eng/tests/` — Unit tests (run with `pytest`).
+---
 
-Quick start (summary)
+All runnable code, tests, and documentation live in [`eng/`](eng/README.md).
+
 ```bash
 cd eng
-python -m venv .venv
-source .venv/bin/activate
+python -m venv .venv && source .venv/bin/activate
 pip install -r requirements.txt
-python runner.py --mock --request "Generate CLTV per customer from ecommerce orders" --repo .
+pytest -q                          # 49 tests, all passing
+python runner.py --request "migrate risk_level to RiskCategory enum" --repo ./demo_repo
 ```
 
-If you'd prefer the full `eng/README.md` moved to the repository root (so the root page shows the full docs), I can do that for you.
+Full documentation: [eng/README.md](eng/README.md)

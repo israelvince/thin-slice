@@ -154,11 +154,11 @@ def file_value_label(filename: str, snippet: str) -> str:
     for line in snippet.splitlines()[:30]:
         s = line.strip()
         if (s.startswith('"""') or s.startswith("'''")) and len(s) > 6:
-            desc = s.strip('"\'').strip()
+            desc = s.strip('"\'').strip().rstrip('.!?').strip()
             if len(desc) > 10:
                 return desc
         if s.startswith('#') and len(s) > 15 and not s.startswith('#!'):
-            return s.lstrip('# ').strip()
+            return s.lstrip('# ').strip().rstrip('.!?').strip()
     return os.path.splitext(os.path.basename(filename))[0].replace('_', ' ').replace('-', ' ')
 
 

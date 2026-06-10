@@ -367,7 +367,7 @@ def post_budget_check(say, thread_ts: str, token_count: int) -> None:
 
     # ── Simple change fast-path: no slicing needed ───────────────────────────
     _annotation = _is_annotation_request(state.user_request)
-    if (overall_risk == "LOW" or _annotation) and blast_radius == 0 and not coupled:
+    if (overall_risk == "LOW" or (_annotation and len(non_readme) == 1)) and blast_radius == 0 and not coupled:
         pending_slice_maps[thread_ts] = [non_readme]
         trigger_reason = "shipping risk" if token_count <= _BUDGET_THRESHOLD else "token budget"
         say(
@@ -419,6 +419,9 @@ def post_budget_check(say, thread_ts: str, token_count: int) -> None:
                 return s.lstrip('# ').strip()
         return os.path.splitext(os.path.basename(filename))[0].replace('_', ' ').replace('-', ' ')
 
+    def _clean_label(label: str) -> str:
+        return label.rstrip('.!?').strip()
+
     # ── Semantic slice title detection ────────────────────────────────────────
     def _detect_fields(request: str) -> List[str]:
         candidates = [
@@ -463,7 +466,7 @@ def post_budget_check(say, thread_ts: str, token_count: int) -> None:
 
         # Fallback: derive titles from what the changed files actually describe
         non_test_files = [f for f in non_readme if folder_category(f) not in ("tests", "readme")]
-        value_labels = list(dict.fromkeys(_file_value_label(f) for f in non_test_files))
+        value_labels = list(dict.fromkeys(_clean_label(_file_value_label(f)) for f in non_test_files))
         if len(value_labels) >= 2:
             return [f"{label} complete and verifiable" for label in value_labels[:3]]
         if len(value_labels) == 1:
@@ -535,7 +538,7 @@ def post_budget_check(say, thread_ts: str, token_count: int) -> None:
 
     def _slice_invest(fs: List[str], graph: Dict[str, List[str]], other_files: set) -> str:
         depends_on_other = any(dep in other_files for f in fs for dep in graph.get(f, []))
-        if not depends_on_other and len(fs) <= 3 and _estimate_lines(fs) <= 150:
+        if not depends_on_other and len(fs) <= 3:
             return "Independent | Valuable | Testable in isolation"
         return "Depends on Slice 1 shipping first — not fully independent"
 

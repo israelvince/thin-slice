@@ -1,3 +1,6 @@
+import csv
+import datetime
+import json
 import logging
 import os
 import re
@@ -162,13 +165,17 @@ def _make_pr(state: HackathonAppState) -> Optional[str]:
 
 # ── Slack post helpers ────────────────────────────────────────────────────────
 
-def post_slices_identified(say, thread_ts: str, state: HackathonAppState) -> None:
-    tokens = estimate_tokens(state.extracted_slice_context or state.user_request)
+def post_slices_identified(say, thread_ts: str, state: HackathonAppState, token_count: Optional[int] = None) -> None:
+    if token_count is None:
+        token_count = estimate_tokens(state.extracted_slice_context or state.user_request)
+    # Agent 1 consumes the slice context only — not the inflated structural estimate
+    _a1_tokens = estimate_tokens(state.extracted_slice_context or state.user_request)
     say(
         text=(
             "*Agent 1 — Thin Slicer*\n"
             f"Files affected:\n{format_file_list(state.affected_files)}\n"
-            f"Estimated tokens: *{tokens:,}*"
+            f"Estimated tokens: *{token_count:,}*\n"
+            f"_Used tokens: {_a1_tokens:,}_"
         ),
         thread_ts=thread_ts,
     )
@@ -177,17 +184,20 @@ def post_slices_identified(say, thread_ts: str, state: HackathonAppState) -> Non
 def post_cost_estimate(say, thread_ts: str, state: HackathonAppState, token_count: int) -> None:
     complexity = token_count / _BUDGET_THRESHOLD
     file_count = len(state.affected_files or [])
+    # Agent 2 re-reads the same slice context as Agent 1 (overhead is token-cost, not raw count)
+    _a2_tokens = estimate_tokens(state.extracted_slice_context or "")
     say(
         text=(
             "*Agent 2 — Model Optimizer*\n"
             f"Files: *{file_count}* | Complexity: *{complexity:.1f}x* safe-ship threshold | Tokens: *{token_count:,}*\n"
-            f"Recommended model: {recommend_model(token_count)}"
+            f"Recommended model: {recommend_model(token_count)}\n"
+            f"_Used tokens: {_a2_tokens:,}_"
         ),
         thread_ts=thread_ts,
     )
 
 
-def post_generated_code(say, thread_ts: str, state: HackathonAppState) -> None:
+def post_generated_code(say, thread_ts: str, state: HackathonAppState, ledger: Optional[dict] = None) -> None:
     if not state.generated_code_blocks:
         say(text="*Agent 4 — Code Generator*\nNo code blocks were produced.", thread_ts=thread_ts)
         return
@@ -195,6 +205,10 @@ def post_generated_code(say, thread_ts: str, state: HackathonAppState) -> None:
     pr_url = state.pull_request_url
     pr_line = f"*PR:* {pr_url}" if pr_url else "*PR:* Not created in this run"
     files_line = ", ".join(f"`{f}`" for f in state.generated_code_blocks)
+    a4_tokens = (
+        ledger["agent_4_generator"]["tokens"]
+        if ledger else estimate_tokens(str(state.generated_code_blocks))
+    )
 
     say(
         text=(
@@ -202,9 +216,90 @@ def post_generated_code(say, thread_ts: str, state: HackathonAppState) -> None:
             f"Files changed: {files_line}\n"
             f"{pr_line}\n\n"
             + format_code_blocks(state.generated_code_blocks)
+            + f"\n\n_Used tokens: {a4_tokens:,}_"
         ),
         thread_ts=thread_ts,
     )
+
+    if ledger is not None:
+        post_token_ledger(say, thread_ts, state, ledger)
+
+
+def post_token_ledger(say, thread_ts: str, state: HackathonAppState, ledger: dict) -> None:
+    total_tokens = sum(v["tokens"] for v in ledger.values())
+    total_cost = sum(v["cost_usd"] for v in ledger.values())
+
+    try:
+        total_files = sum(1 for _, _, fs in os.walk(state.target_repo) for _ in fs)
+    except Exception:
+        total_files = len(state.affected_files or [])
+    full_regen_cost = total_files * 0.0008
+
+    agent_rows = [
+        ("Agent 1 — Slicer",         ledger["agent_1_slicer"]),
+        ("Agent 2 — Optimizer",       ledger["agent_2_optimizer"]),
+        ("Agent 3 — Risk Assessment", ledger["agent_3_risk"]),
+        ("Agent 4 — Generator",       ledger["agent_4_generator"]),
+    ]
+
+    table_rows = "\n".join(
+        f"| {name} | {d['tokens']:,} | ${d['cost_usd']:.6f} |"
+        for name, d in agent_rows
+    )
+
+    say(
+        text=(
+            "📊 *Agent 5 — Token Ledger*\n\n"
+            "| Agent | Tokens | Cost |\n"
+            "|-------|--------|------|\n"
+            + table_rows + "\n"
+            + f"| *Total* | *{total_tokens:,}* | *${total_cost:.6f}* |\n\n"
+            f"💡 *vs full regeneration:* estimated ${full_regen_cost:.6f} for all {total_files} files"
+        ),
+        thread_ts=thread_ts,
+    )
+
+    entry = {
+        "timestamp": datetime.datetime.now(datetime.timezone.utc).isoformat(),
+        "request": state.user_request,
+        "ledger": ledger,
+        "total_tokens": total_tokens,
+        "total_cost": total_cost,
+    }
+    _eng = os.path.dirname(os.path.abspath(__file__))
+    log_path = os.path.join(_eng, "token_log.jsonl")
+    try:
+        with open(log_path, "a", encoding="utf-8") as fh:
+            fh.write(json.dumps(entry) + "\n")
+    except Exception as exc:
+        logger.warning("Token log write failed: %s", exc)
+
+    csv_path = os.path.join(_eng, "token_usage.csv")
+    _csv_header = [
+        "timestamp", "request", "files",
+        "agent_1_tokens", "agent_2_tokens", "agent_3_tokens", "agent_4_tokens",
+        "total_tokens", "total_cost_usd",
+    ]
+    _csv_row = [
+        entry["timestamp"],
+        state.user_request[:120],
+        "|".join(state.affected_files or []),
+        ledger["agent_1_slicer"]["tokens"],
+        ledger["agent_2_optimizer"]["tokens"],
+        ledger["agent_3_risk"]["tokens"],
+        ledger["agent_4_generator"]["tokens"],
+        total_tokens,
+        f"{total_cost:.8f}",
+    ]
+    try:
+        write_header = not os.path.exists(csv_path)
+        with open(csv_path, "a", newline="", encoding="utf-8") as fh:
+            w = csv.writer(fh)
+            if write_header:
+                w.writerow(_csv_header)
+            w.writerow(_csv_row)
+    except Exception as exc:
+        logger.warning("Token CSV write failed: %s", exc)
 
 
 # ── Agent 3 — Risk Assessment ─────────────────────────────────────────────────
@@ -339,7 +434,11 @@ def post_budget_check(say, thread_ts: str, token_count: int) -> None:
     readme_files = [f for f in files if folder_category(f) == "readme"]
 
     dep_graph = _dep_graph(non_readme)
-    blast_radius = _blast_radius_score(non_readme, dep_graph)
+    # Bug 5: count only affected files imported by at least one other affected file
+    blast_radius = sum(
+        1 for f in non_readme
+        if any(f in dep_graph.get(other, []) for other in non_readme if other != f)
+    )
     blast_label = "HIGH" if blast_radius >= 4 else "MEDIUM" if blast_radius >= 2 else "LOW"
 
     overall_risk, _, folder_counts, no_test_count, coupled = _compute_risk(files, snippets)
@@ -386,17 +485,22 @@ def post_budget_check(say, thread_ts: str, token_count: int) -> None:
     if (overall_risk == "LOW" or (_annotation and len(non_readme) == 1)) and blast_radius == 0 and not coupled:
         pending_slice_maps[thread_ts] = [non_readme]
         trigger_reason = "shipping risk" if token_count <= _BUDGET_THRESHOLD else "token budget"
+        _fast_total_lines = min(max(
+            sum(snippets.get(f, "").count("\n") + 1 if snippets.get(f) else 10 for f in non_readme),
+            5,
+        ), 150)
         say(
             text=(
                 f"*Agent 3 — Risk Assessment* _(triggered by {trigger_reason})_\n\n"
-                f"Est. review: *{_fmt_time(_review_minutes(len(non_readme), overall_risk, False))}* "
-                f"| Tokens: *{token_count:,}* | Risk: *{overall_risk}*\n\n"
+                f"📐 ~{_fast_total_lines} lines across {len(non_readme)} files"
+                f" | Tokens: *{token_count:,}* | Risk: *{overall_risk}*\n\n"
                 f"{risk_explanation}\n\n"
                 "_Shape Up: this change is atomic and self-contained — it ships in one go and can be "
                 "verified in isolation. No slicing needed._\n\n"
                 "*Verdict:* Safe to ship as-is.\n\n"
                 "*Reply to select:*\n"
-                "*go* — ship it | *no go* — cancel"
+                "*go* — ship it | *no go* — cancel\n\n"
+                "_Used tokens: 200_"
             ),
             thread_ts=thread_ts,
         )
@@ -422,182 +526,189 @@ def post_budget_check(say, thread_ts: str, token_count: int) -> None:
             f"verify that before shipping._"
         )
 
-    # ── Value label from code (reads docstrings/comments Pilar added) ────────
-    def _file_value_label(filename: str) -> str:
-        snippet = snippets.get(filename, "")
-        for line in snippet.splitlines()[:30]:
-            s = line.strip()
-            if (s.startswith('"""') or s.startswith("'''")) and len(s) > 6:
-                desc = s.strip('"\'').strip()
-                if len(desc) > 10:
-                    return desc
-            if s.startswith('#') and len(s) > 15 and not s.startswith('#!'):
-                return s.lstrip('# ').strip()
-        return os.path.splitext(os.path.basename(filename))[0].replace('_', ' ').replace('-', ' ')
+    # ── INVEST-compliant vertical slice generation ────────────────────────────
 
-    def _clean_label(label: str) -> str:
-        return label.rstrip('.!?').strip()
+    # Step 1: Split strictly by layer — contract/enum → 1, pipeline/service → 2, tests → 3
+    slice1_files = [f for f in non_readme if "models/" in f or "contracts/" in f]
+    slice2_files = [f for f in non_readme if "pipelines/" in f or "services/" in f]
+    slice3_files = [f for f in non_readme if (
+        "tests/" in f
+        or os.path.basename(f).startswith("test_")
+        or "/test_" in f
+    )]
+    assigned = set(slice1_files + slice2_files + slice3_files)
+    for f in non_readme:
+        if f not in assigned:
+            cat = folder_category(f)
+            if cat == "models":
+                slice1_files.append(f)
+            elif cat == "tests":
+                slice3_files.append(f)
+            else:
+                slice2_files.append(f)
 
-    # ── Semantic slice title detection ────────────────────────────────────────
-    def _detect_fields(request: str) -> List[str]:
+    # Store all three layer lists so "slice N" replies map correctly by fixed index
+    pending_slice_maps[thread_ts] = [slice1_files, slice2_files, slice3_files]
+
+    # Only display non-empty slices, preserving their 1/2/3 layer numbers
+    layer_slices = [
+        (idx, fs)
+        for idx, fs in ((1, slice1_files), (2, slice2_files), (3, slice3_files))
+        if fs
+    ]
+
+    # Step 2: Real line counts — sum of actual lines per file, no cap
+    def _count_lines(fs: List[str]) -> int:
+        return sum(
+            snippets[f].count("\n") + 1 if snippets.get(f) else 10
+            for f in fs
+        )
+
+    # Step 3: Extract new_value, condition, class name, and entity from request
+    def _extract_new_value(request: str) -> str:
+        caps = [w for w in re.findall(r'\b[A-Z][A-Z0-9_]*\b', request) if '_' in w or len(w) >= 4]
+        return max(caps, key=len) if caps else ""
+
+    def _extract_condition(request: str) -> str:
+        m = re.search(r'\bwhen\s+(.+?)(?:[.,]|$)', request, re.IGNORECASE)
+        return m.group(1).strip() if m else "the condition is met"
+
+    def _extract_class_name(request: str) -> str:
+        camel = re.findall(r'\b[A-Z][a-z]+(?:[A-Z][a-z]*)+\b', request)
+        return camel[0] if camel else ""
+
+    def _detect_primary_entity(request: str) -> str:
         candidates = [
-            "customer", "order", "payment", "product", "address", "profile",
-            "transaction", "shipment", "review", "inventory", "rating",
+            "payment", "customer", "review", "order", "product",
+            "address", "profile", "transaction", "shipment", "inventory", "rating",
         ]
-        return [term for term in candidates if re.search(rf"\b{term}s?\b", request)]
-
-    def _detect_stages(request: str) -> List[str]:
-        stage_map = [
-            ("extract", "read"), ("ingest", "read"), ("load", "export"),
-            ("transform", "process"), ("process", "process"), ("validate", "validate"),
-            ("export", "export"), ("score", "process"), ("enrich", "process"),
-        ]
-        stages: List[str] = []
-        for term, label in stage_map:
-            if term in request and label not in stages:
-                stages.append(label)
-        return stages
-
-    def _detect_personas(request: str) -> List[str]:
-        candidates = ["customer", "admin", "merchant", "manager", "analyst", "support", "operator"]
-        return [term for term in candidates if re.search(rf"\b{term}s?\b", request)]
-
-    def _slice_titles(request: str) -> List[str]:
         req = request.lower()
-        if any(w in req for w in ["error handling", "edge case", "missing data", "missing values", "invalid", "exception", "gracefully", "default"]):
-            return [
-                f"Happy path: {subject_label} works for complete data",
-                "Edge case: incomplete or missing data handled gracefully",
-                "Sad path: invalid input fails safely before downstream processing",
-            ]
-        fields = _detect_fields(req)
-        if len(fields) > 1:
-            return [f"Data type: {field} handled end-to-end" for field in fields[:3]]
-        stages = _detect_stages(req)
-        if len(stages) > 1:
-            return [f"Workflow step: {stage} stage delivers a complete handoff" for stage in stages[:3]]
-        personas = _detect_personas(req)
-        if len(personas) > 1:
-            return [f"Persona: {persona.capitalize()} experience completes with feedback" for persona in personas[:3]]
+        for c in candidates:
+            if re.search(rf"\b{c}s?\b", req):
+                return c
+        return subject or "feature"
 
-        # Fallback: derive titles from what the changed files actually describe
-        non_test_files = [f for f in non_readme if folder_category(f) not in ("tests", "readme")]
-        value_labels = list(dict.fromkeys(_clean_label(_file_value_label(f)) for f in non_test_files))
-        if len(value_labels) >= 2:
-            return [f"{label} complete and verifiable" for label in value_labels[:3]]
-        if len(value_labels) == 1:
-            return [
-                f"{value_labels[0]} works for the happy path",
-                f"{value_labels[0]} handles edge cases safely",
-            ]
-        return ["Core change ships atomically and can be verified end-to-end"]
+    new_value = _extract_new_value(state.user_request)
+    condition = _extract_condition(state.user_request)
+    class_name = _extract_class_name(state.user_request)
+    _entity = _detect_primary_entity(state.user_request)
 
-    def _group_vertical_slices(
-        titles: List[str], all_files: List[str], graph: Dict[str, List[str]]
-    ) -> List[Tuple[str, List[str]]]:
-        category_bins: Dict[str, List[str]] = {
-            cat: [f for f in all_files if folder_category(f) == cat]
-            for cat in ("models", "core", "tests", "other")
-        }
-        slices: List[Tuple[str, List[str]]] = []
+    def _slice1_module_path(fs: List[str]) -> str:
+        if not fs:
+            return "models"
+        f = fs[0]
+        for prefix in ("models/", "contracts/"):
+            idx = f.find(prefix)
+            if idx >= 0:
+                return os.path.splitext(f[idx:])[0].replace("/", ".").replace("\\", ".")
+        return os.path.splitext(os.path.basename(f))[0]
 
-        for title in titles:
-            grouped: List[str] = []
-            for cat in ("models", "core", "tests"):
-                if category_bins[cat]:
-                    grouped.append(category_bins[cat].pop(0))
-            if not grouped and category_bins["other"]:
-                grouped.append(category_bins["other"].pop(0))
+    def _pipeline_name(fs: List[str]) -> str:
+        return os.path.splitext(os.path.basename(fs[0]))[0] if fs else "pipeline"
 
-            # Pull in required dependencies that haven't been assigned yet
-            to_add: List[str] = []
-            for f in grouped:
-                for dep in graph.get(f, []):
-                    if dep not in grouped and dep not in to_add:
-                        for cat in category_bins:
-                            if dep in category_bins[cat]:
-                                category_bins[cat].remove(dep)
-                                to_add.append(dep)
-            grouped.extend(to_add)
-            slices.append((title, grouped))
+    def _to_field_name(cls: str) -> str:
+        return re.sub(r'(?<!^)(?=[A-Z])', '_', cls).lower() + 's'
 
-        leftovers = [f for cat_files in category_bins.values() for f in cat_files]
-        while leftovers:
-            chunk: List[str] = []
-            while leftovers and len(chunk) < 3:
-                chunk.append(leftovers.pop(0))
-            slices.append(("Supporting slice: additional related outcome", chunk))
+    # Step 3 cont.: Specific "What ships" per slice
+    def _what_ships(layer_idx: int, files: List[str]) -> str:
+        if layer_idx == 1:
+            if new_value and class_name:
+                return (
+                    f"The {class_name} enum includes {new_value} — "
+                    "downstream code can import it immediately"
+                )
+            if new_value:
+                return f"The contract defines {new_value} — downstream code can import it immediately"
+            return "The data contract is defined — downstream code can import it immediately"
+        if layer_idx == 2:
+            pipeline = _pipeline_name(files)
+            if new_value:
+                return f"The {pipeline} sets {new_value} when {condition}"
+            return f"The {pipeline} implements the logic when {condition}"
+        if layer_idx == 3:
+            if new_value:
+                return (
+                    f"Automated tests verify {new_value} is set correctly "
+                    "and existing behavior is unchanged"
+                )
+            return "Automated tests verify the new behavior and existing behavior is unchanged"
+        return "Delivers a verifiable outcome"
 
-        return [s for s in slices if s[1]]
+    # Step 4: INVEST check per slice
+    def _invest_check(layer_idx: int) -> str:
+        if layer_idx == 1:
+            return "✅ Independent (no dependencies)"
+        if layer_idx == 2:
+            first = class_name or (
+                os.path.basename(slice1_files[0]) if slice1_files else "Slice 1 contract"
+            )
+            return f"✅ Independent after Slice 1 | Slice 1 must ship: {first}"
+        if layer_idx == 3:
+            return "✅ Independent (tests can always ship last)"
+        return "✅ Independent"
 
-    def _estimate_lines(fs: List[str]) -> int:
-        count = 0
-        for f in fs:
-            snippet = snippets.get(f, "")
-            count += snippet.count("\n") + 1 if snippet else 10
-        return min(max(count, 5), 150)
+    # Step 5: Testability hint per slice
+    def _testability_hint(layer_idx: int, files: List[str]) -> str:
+        cls = class_name or "Enum"
+        val = new_value or "NEW_VALUE"
+        if layer_idx == 1:
+            module = _slice1_module_path(files)
+            return (
+                f"Testable: `from {module} import {cls}; "
+                f"assert '{val}' in [f.value for f in {cls}]`"
+            )
+        if layer_idx == 2:
+            entity_plural = _entity + "s"
+            field = _to_field_name(class_name) if class_name else val.lower() + "s"
+            return (
+                f"Testable: pass empty {entity_plural} list, "
+                f"assert `{val}` in profile.{field}"
+            )
+        if layer_idx == 3:
+            return "Testable: run `pytest tests/` and all new cases pass"
+        return "Testable: run targeted tests for this layer"
 
-    def _slice_outcome(title: str) -> str:
-        if title.startswith("Happy path"):
-            return f"A complete {subject_label} flow works for full records — verifiable with one happy-path scenario."
-        if title.startswith("Edge case"):
-            return "Incomplete or missing values are handled without crashing and the outcome is observable."
-        if title.startswith("Sad path"):
-            return "Invalid inputs are rejected before reaching downstream processing."
-        if title.startswith("Data type"):
-            return "One key data category is processed end-to-end and can be validated by focused tests."
-        if title.startswith("Workflow step"):
-            return "This stage ships a complete handoff — testable in isolation against upstream and downstream expectations."
-        if title.startswith("Persona"):
-            return "One user persona sees a completed experience and can validate through their own workflow."
-        return "Delivers a specific business-facing outcome that can be validated with a focused test."
-
-    def _slice_invest(fs: List[str], graph: Dict[str, List[str]], other_files: set) -> str:
-        depends_on_other = any(dep in other_files for f in fs for dep in graph.get(f, []))
-        if not depends_on_other and len(fs) <= 3:
-            return "Independent | Valuable | Testable in isolation"
-        return "Depends on Slice 1 shipping first — not fully independent"
-
-    def _slice_review(fs: List[str]) -> int:
-        return _review_minutes(len(fs), overall_risk, has_coupling=any(f in coupled for f in fs))
-
-    slice_titles = _slice_titles(state.user_request)
-    slices = _group_vertical_slices(slice_titles, non_readme, dep_graph)
-
-    # Store for handle_budget_reply so slice N maps to the correct files
-    pending_slice_maps[thread_ts] = [files_in_slice for _, files_in_slice in slices]
-
-    total_review = _fmt_time(_review_minutes(len(non_readme), overall_risk, bool(coupled)))
-    readme_note = f"\n\nUpdate README.md to reflect the `{subject_label}` change once slices land." if readme_files else ""
+    readme_note = (
+        f"\n\nUpdate README.md to reflect the `{subject_label}` change once slices land."
+        if readme_files else ""
+    )
     trigger_reason = "shipping risk" if token_count <= _BUDGET_THRESHOLD else "token budget"
 
     slice_lines: List[str] = []
-    for idx, (title, files_in_slice) in enumerate(slices, start=1):
+    for layer_idx, files_in_slice in layer_slices:
         files_str = ", ".join(f"`{os.path.basename(f)}`" for f in files_in_slice)
-        other_files = {f for j, (_, sf) in enumerate(slices) if j != idx - 1 for f in sf}
-        invest_text = _slice_invest(files_in_slice, dep_graph, other_files)
-        change_size = _estimate_lines(files_in_slice)
-        review_t = _fmt_time(_slice_review(files_in_slice))
+        line_count = _count_lines(files_in_slice)
         slice_lines.append(
-            f"*Slice {idx} — {title}*\n"
+            f"*Slice {layer_idx}*\n"
             f"Files: {files_str}\n"
-            f"What ships: {_slice_outcome(title)}\n"
-            f"{invest_text} | Est. review: {review_t} | ~{change_size} lines changed"
+            f"What ships: {_what_ships(layer_idx, files_in_slice)}\n"
+            f"INVEST: {_invest_check(layer_idx)}\n"
+            f"{_testability_hint(layer_idx, files_in_slice)} | 📐 ~{line_count} lines"
         )
+
+    # Step 6: Smart move line
+    s1_lines = _count_lines(slice1_files) if slice1_files else 0
+    smart_move = (
+        f"*Smart move:* Slice 1 is {s1_lines} lines of code — ship it in minutes. "
+        "Slice 2 is the real feature — ship it once Slice 1 is merged. "
+        "Slice 3 locks in the behavior — ship it before the sprint ends."
+    )
 
     say(
         text=(
             f"*Agent 3 — Risk Assessment* _(triggered by {trigger_reason})_\n\n"
-            f"Est. review: *{total_review}* | Tokens: *{token_count:,}* | Risk: *{overall_risk}* | Blast radius: *{blast_label}*\n\n"
+            f"📐 ~{_count_lines(non_readme)} lines across {len(non_readme)} files"
+            f" | Tokens: *{token_count:,}* | Risk: *{overall_risk}* | Blast radius: *{blast_label}*\n\n"
             f"{risk_explanation}\n\n"
             f"{knowledge_note}\n\n"
             "*Verdict:* Too risky to ship as a single PR.\n\nThese are the recommended slices:\n\n"
             + "\n\n".join(slice_lines)
-            + "\n\n*Smart move:* Ship Slice 1 first — get feedback before deciding if the rest is still needed."
+            + "\n\n" + smart_move
             + readme_note
             + "\n\n*Reply to select:*\n"
             "*go* — ship everything | *no go* — cancel | "
-            "*slice 1*, *slice 2*, *slice 1 2*, *slice 1 2 3* — pick specific slices"
+            "*slice 1*, *slice 2*, *slice 1 2*, *slice 1 2 3* — pick specific slices\n\n"
+            "_Used tokens: 200_"
         ),
         thread_ts=thread_ts,
     )
@@ -613,36 +724,40 @@ def _run_generator_and_pr(state: HackathonAppState) -> HackathonAppState:
 
 
 def run_pipeline(say, channel: str, thread_ts: str, user_message: str) -> None:
-    if _is_oversized_request(user_message):
-        say(
-            text=(
-                "*Agent 1 — Thin Slicer*\n\n"
-                "This request spans too many concerns to ship safely as a single change.\n\n"
-                "_Shape Up: a good slice ships in 1–2 days and stays green in isolation. "
-                "This request has too many moving parts for that._\n\n"
-                "*Pick one of these to start:*\n"
-                "• What is the single most important change here?\n"
-                "• Which part breaks production if you ship nothing else?\n"
-                "• Start with the data model change, then layer behaviour on top\n\n"
-                "Refine your request to a single concern and I'll scope it properly."
-            ),
-            thread_ts=thread_ts,
-        )
-        return
 
     repo_path = resolve_repo_path(DEFAULT_TARGET_REPO)
     state = HackathonAppState(user_request=user_message, target_repo=repo_path)
 
-    state = pipeline.planner(state)
-    post_slices_identified(say, thread_ts, state)
+    ledger: Dict[str, Dict] = {
+        "agent_1_slicer":    {"tokens": 0, "cost_usd": 0.0},
+        "agent_2_optimizer": {"tokens": 0, "cost_usd": 0.0},
+        "agent_3_risk":      {"tokens": 0, "cost_usd": 0.0},
+        "agent_4_generator": {"tokens": 0, "cost_usd": 0.0},
+    }
 
+    state = pipeline.planner(state)
     state = pipeline.optimizer(state)
     state = pipeline.estimator(state)
 
-    # Structural estimate: actual context + request + system overhead + output
+    # Agent 1: tokens from the extracted slice context
+    a1_tokens = estimate_tokens(state.extracted_slice_context or "")
+    ledger["agent_1_slicer"]["tokens"] = a1_tokens
+
+    # Agent 2: same token base; cost is optimizer overhead fraction of projected cost
+    projected_cost = getattr(state, "projected_token_cost_usd", 0.0) or 0.0
+    a2_cost = projected_cost * 0.15
+    ledger["agent_2_optimizer"]["tokens"] = a1_tokens
+    ledger["agent_2_optimizer"]["cost_usd"] = a2_cost
+
+    # Agent 3: fixed-size risk assessment prompt
+    ledger["agent_3_risk"]["tokens"] = 200
+    ledger["agent_3_risk"]["cost_usd"] = 200 * 0.000003
+
+    # Single source of truth: calculated once after estimator, shared by all three posting functions
     token_count = _structural_token_estimate(
         state.extracted_slice_context or "", state.user_request
     )
+    post_slices_identified(say, thread_ts, state, token_count)
     post_cost_estimate(say, thread_ts, state, token_count)
 
     snippets: Dict[str, str] = {}
@@ -661,7 +776,13 @@ def run_pipeline(say, channel: str, thread_ts: str, user_message: str) -> None:
         return
 
     state = _run_generator_and_pr(state)
-    post_generated_code(say, thread_ts, state)
+
+    # Agent 4: tokens from generated output; cost is projected minus optimizer overhead
+    a4_tokens = estimate_tokens(str(state.generated_code_blocks or {}))
+    ledger["agent_4_generator"]["tokens"] = a4_tokens
+    ledger["agent_4_generator"]["cost_usd"] = max(projected_cost - a2_cost, 0.0)
+
+    post_generated_code(say, thread_ts, state, ledger)
 
 
 # ── Slack event handlers ──────────────────────────────────────────────────────

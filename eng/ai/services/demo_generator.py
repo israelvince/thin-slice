@@ -15,13 +15,41 @@ def detect_intent(user_request: str) -> str:
     req = user_request.lower()
     if any(w in req for w in ["log statement", "log when", "log ", "logging", "logger", "log if"]):
         return "logging"
+    if any(w in req for w in ["print statement", "print(", "print when", "print at the start", "hello world"]):
+        return "print_statement"
+    if any(w in req for w in ["error handling", "try/except", "try except", "exception", "handle error", "wrap in try"]):
+        return "error_handling"
+    if any(w in req for w in ["comment to the top", "comment at the top", "comment explaining", "add a comment"]):
+        return "comment_top"
     if any(w in req for w in ["riskcategory", "risk_category", "enum", "migrate risk_level", "replace risk_level"]):
         return "enum_migration"
     if any(w in req for w in ["missing", "gracefully", "default to 0", "no reviews", "no order history", "null", "none check"]):
         return "null_handling"
-    if any(w in req for w in ["docstring", "documentation", "describe", "summary"]):
+    if any(w in req for w in ["docstring", "documentation", "describe formula", "explaining the"]):
         return "docstring"
+    if any(w in req for w in ["input validation", "validate input", "validate all", "validation to all"]):
+        return "input_validation"
     return "generic"
+
+
+def resolve_target_function(user_request: str) -> Optional[str]:
+    """Extract the target function name from the request, e.g. 'main function' → 'main'."""
+    req = user_request.lower()
+    # Named function: "the X function" or "function X" or "def X"
+    patterns = [
+        r'the\s+(\w+)\s+function',
+        r'function\s+(\w+)',
+        r'method\s+(\w+)',
+        r'(\w+)\s+function',
+        r'to\s+the\s+(\w+)\s+function',
+    ]
+    for pattern in patterns:
+        m = re.search(pattern, req)
+        if m:
+            name = m.group(1)
+            if name not in ("the", "a", "an", "this", "that", "each", "all", "every"):
+                return name
+    return None
 
 
 def load_file(filepath: str, snippets: Dict[str, str], repo_path: str) -> str:
@@ -50,12 +78,20 @@ def generate(
 
     if intent == "logging":
         return _apply_logging(files[0], snippets, repo_path, user_request)
+    if intent == "print_statement":
+        return _apply_print_statement(files[0], snippets, repo_path, user_request)
+    if intent == "error_handling":
+        return _apply_error_handling(files[0], snippets, repo_path, user_request)
+    if intent == "comment_top":
+        return _apply_comment_top(files[0], snippets, repo_path, user_request)
     if intent == "enum_migration":
         return _apply_enum_migration(files, snippets, repo_path)
     if intent == "null_handling":
         return _apply_null_handling(files[0], snippets, repo_path, user_request)
     if intent == "docstring":
         return _apply_docstring(files[0], snippets, repo_path, user_request)
+    if intent == "input_validation":
+        return _apply_input_validation(files[0], snippets, repo_path, user_request)
     return _apply_generic(files, snippets, repo_path)
 
 
@@ -395,6 +431,275 @@ def _apply_docstring(
                 fn_label = fn_name.group(1).replace("_", " ") if fn_name else "function"
                 result.append(f'{indent}"""Execute {fn_label} and return the result."""')
         i += 1
+
+    return {filepath: "\n".join(result) + "\n"}
+
+
+# ── Print statement ───────────────────────────────────────────────────────────
+
+def _apply_print_statement(
+    filepath: str,
+    snippets: Dict[str, str],
+    repo_path: str,
+    request: str,
+) -> Dict[str, str]:
+    content = load_file(filepath, snippets, repo_path)
+    if not content:
+        return {}
+
+    target_fn = resolve_target_function(request) or "main"
+    lines = content.splitlines()
+    result: List[str] = []
+    inserted = False
+    i = 0
+
+    while i < len(lines):
+        line = lines[i]
+        result.append(line)
+
+        if not inserted and re.search(rf'\bdef\s+{re.escape(target_fn)}\s*\(', line):
+            i += 1
+            # Collect any blank lines between def and body
+            while i < len(lines) and not lines[i].strip():
+                result.append(lines[i])
+                i += 1
+            if i >= len(lines):
+                break
+            indent = " " * (len(lines[i]) - len(lines[i].lstrip()))
+            # Skip over an existing docstring
+            if lines[i].strip().startswith(('"""', "'''")):
+                result.append(lines[i])
+                closing = lines[i].strip()[:3]
+                i += 1
+                while i < len(lines):
+                    result.append(lines[i])
+                    if lines[i].strip().endswith(closing) and i > len(result) - 3:
+                        i += 1
+                        break
+                    i += 1
+                if i < len(lines):
+                    indent = " " * (len(lines[i]) - len(lines[i].lstrip()))
+            result.append(f'{indent}print("Application started — {target_fn} initialised")')
+            inserted = True
+            continue
+        i += 1
+
+    if not inserted:
+        # Append at end of file if function not found
+        result.append(f'\n# print added at module level (function "{target_fn}" not found)')
+        result.append(f'print("Application started")')
+
+    return {filepath: "\n".join(result) + "\n"}
+
+
+# ── Error handling wrapper ────────────────────────────────────────────────────
+
+def _apply_error_handling(
+    filepath: str,
+    snippets: Dict[str, str],
+    repo_path: str,
+    request: str,
+) -> Dict[str, str]:
+    content = load_file(filepath, snippets, repo_path)
+    if not content:
+        return {}
+
+    target_fn = resolve_target_function(request)
+    lines = content.splitlines()
+    result: List[str] = []
+
+    # Ensure logging is imported
+    has_logging = any("import logging" in ln for ln in lines)
+    has_logger = any("getLogger" in ln for ln in lines)
+
+    i = 0
+    if not has_logging:
+        # Insert before first import
+        while i < len(lines) and not lines[i].strip():
+            result.append(lines[i])
+            i += 1
+        result.append("import logging")
+        if not has_logger:
+            result.append("logger = logging.getLogger(__name__)")
+            result.append("")
+
+    in_target = False
+    fn_indent = 0
+    body_lines: List[str] = []
+    collecting = False
+
+    while i < len(lines):
+        line = lines[i]
+
+        if not collecting:
+            fn_match = re.match(r'^(\s*)def\s+(\w+)\s*\(', line)
+            if fn_match:
+                current_fn = fn_match.group(2)
+                fn_indent = len(fn_match.group(1))
+                in_target = target_fn is None or current_fn == target_fn
+                if in_target:
+                    result.append(line)
+                    i += 1
+                    # Collect function header lines (multi-line args, colon)
+                    while i < len(lines) and not lines[i-1].strip().endswith(":"):
+                        result.append(lines[i])
+                        i += 1
+                    # Skip docstring
+                    if i < len(lines) and lines[i].strip().startswith(('"""', "'''")):
+                        result.append(lines[i])
+                        closing = lines[i].strip()[:3]
+                        i += 1
+                        while i < len(lines):
+                            result.append(lines[i])
+                            stripped = lines[i].strip()
+                            i += 1
+                            if stripped.endswith(closing) and stripped != closing:
+                                break
+                            if stripped == closing:
+                                break
+                    body_lines = []
+                    collecting = True
+                    continue
+            result.append(line)
+            i += 1
+            continue
+
+        # Collecting body lines until the function ends
+        if line.strip() == "" or len(line) - len(line.lstrip()) > fn_indent or not line.strip():
+            body_lines.append(line)
+            i += 1
+            # Check if next non-blank line is at same or lower indent (end of function)
+            peek = i
+            while peek < len(lines) and not lines[peek].strip():
+                peek += 1
+            if peek >= len(lines) or (lines[peek].strip() and len(lines[peek]) - len(lines[peek].lstrip()) <= fn_indent and not lines[peek].startswith(" " * (fn_indent + 1))):
+                # Flush wrapped body
+                _flush_error_wrapped(result, body_lines, fn_indent + 4)
+                body_lines = []
+                collecting = False
+        else:
+            body_lines.append(line)
+            i += 1
+
+    if body_lines:
+        _flush_error_wrapped(result, body_lines, fn_indent + 4)
+
+    return {filepath: "\n".join(result) + "\n"}
+
+
+def _flush_error_wrapped(result: List[str], body: List[str], base_indent: int) -> None:
+    if not any(ln.strip() for ln in body):
+        result.extend(body)
+        return
+    indent = " " * base_indent
+    result.append(f"{indent}try:")
+    for ln in body:
+        result.append("    " + ln if ln.strip() else ln)
+    result.append(f"{indent}except Exception as exc:")
+    result.append(f"{indent}    logger.error(\"Unexpected error: %s\", exc, exc_info=True)")
+    result.append(f"{indent}    raise")
+
+
+# ── Comment / module docstring at top ────────────────────────────────────────
+
+def _apply_comment_top(
+    filepath: str,
+    snippets: Dict[str, str],
+    repo_path: str,
+    request: str,
+) -> Dict[str, str]:
+    content = load_file(filepath, snippets, repo_path)
+    if not content:
+        return {}
+
+    lines = content.splitlines()
+
+    # If first non-blank, non-shebang line is already a docstring, replace it
+    first_real = next((i for i, ln in enumerate(lines) if ln.strip() and not ln.startswith("#!")), 0)
+    module_name = os.path.splitext(os.path.basename(filepath))[0].replace("_", " ")
+
+    # Build a meaningful description from filename and any existing docstring hint
+    existing = lines[first_real].strip() if first_real < len(lines) else ""
+    if existing.startswith('"""') or existing.startswith("'''"):
+        # Already has a module docstring — leave it, just ensure it's descriptive
+        return {filepath: content}
+
+    description = (
+        f'"""{module_name.capitalize()} — '
+        f'{_infer_module_purpose(filepath, content)}\n"""\n'
+    )
+    result = lines[:first_real] + [description] + lines[first_real:]
+    return {filepath: "\n".join(result) + "\n"}
+
+
+def _infer_module_purpose(filepath: str, content: str) -> str:
+    lower = filepath.lower()
+    if "aggregator" in lower:
+        return "reads source CSVs and builds CustomerProfile objects from raw ecommerce data"
+    if "classifier" in lower:
+        return "assigns risk levels to customer profiles based on spend and review history"
+    if "validator" in lower:
+        return "enforces data quality rules before profiles reach downstream consumers"
+    if "churn" in lower:
+        return "scores customer churn risk and flags accounts above the intervention threshold"
+    if "ltv" in lower or "lifetime" in lower:
+        return "calculates predicted customer lifetime value from historical spend data"
+    if "runner" in lower:
+        return "CLI entry point — runs the thin-slice pipeline against a target repository"
+    # Extract first comment or significant line as a hint
+    for line in content.splitlines()[:10]:
+        stripped = line.strip()
+        if stripped.startswith("#") and len(stripped) > 15:
+            return stripped.lstrip("# ").rstrip(".!?")
+    return "part of the customer data product pipeline"
+
+
+# ── Input validation ──────────────────────────────────────────────────────────
+
+def _apply_input_validation(
+    filepath: str,
+    snippets: Dict[str, str],
+    repo_path: str,
+    request: str,
+) -> Dict[str, str]:
+    content = load_file(filepath, snippets, repo_path)
+    if not content:
+        return {}
+
+    lines = content.splitlines()
+    result: List[str] = []
+
+    for i, line in enumerate(lines):
+        result.append(line)
+        # Find function definitions that take parameters (API endpoints or processors)
+        fn_match = re.match(r'^(\s*)def\s+(\w+)\s*\(([^)]+)\)\s*:', line)
+        if not fn_match:
+            continue
+        indent_str = fn_match.group(1)
+        params_raw = fn_match.group(3)
+        body_indent = indent_str + "    "
+
+        # Extract parameter names (skip self, cls, *args, **kwargs, type-annotated)
+        params = []
+        for p in params_raw.split(","):
+            p = p.strip().split(":")[0].split("=")[0].strip()
+            if p and p not in ("self", "cls") and not p.startswith("*"):
+                params.append(p)
+
+        if not params:
+            continue
+
+        # Check if next line is already a docstring or validation
+        next_line = lines[i + 1].strip() if i + 1 < len(lines) else ""
+        if next_line.startswith(('"""', "'''")):
+            continue  # docstring present, skip
+        if "if not" in next_line or "raise" in next_line or "assert" in next_line:
+            continue  # already has guards
+
+        # Add a None guard for the first meaningful param
+        p = params[0]
+        result.append(f'{body_indent}if {p} is None:')
+        result.append(f'{body_indent}    raise ValueError(f"{{repr({p})}} must not be None")')
 
     return {filepath: "\n".join(result) + "\n"}
 

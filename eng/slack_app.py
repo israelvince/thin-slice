@@ -209,11 +209,27 @@ def post_generated_code(say, thread_ts: str, state: HackathonAppState) -> None:
 
 # ── Agent 3 — Risk Assessment ─────────────────────────────────────────────────
 
-_ANNOTATION_WORDS = {"log", "logging", "print", "comment", "docstring", "debug", "trace"}
+_ANNOTATION_WORDS = {
+    "log", "logging", "print", "comment", "docstring", "debug", "trace", "print statement"
+}
+
+_OVERSIZED_SIGNALS = {
+    "entire", "redesign", "real-time", "real time", "streaming", "dashboard",
+    "comprehensive", "complete feature", "across every", "across all", "weekly summary",
+    "aggregation pipeline", "event tracking", "reporting module",
+    "every file", "codebase", "centralized", "retry logic", "exponential backoff",
+}
 
 
 def _is_annotation_request(user_request: str) -> bool:
     return any(w in user_request.lower() for w in _ANNOTATION_WORDS)
+
+
+def _is_oversized_request(user_request: str) -> bool:
+    req = user_request.lower()
+    signal_hits = sum(1 for w in _OVERSIZED_SIGNALS if w in req)
+    scope_indicators = req.count(",") + req.count(" and ")
+    return signal_hits >= 2 or scope_indicators >= 5
 
 
 def _extract_change_subject(user_request: str) -> Optional[str]:
@@ -597,6 +613,23 @@ def _run_generator_and_pr(state: HackathonAppState) -> HackathonAppState:
 
 
 def run_pipeline(say, channel: str, thread_ts: str, user_message: str) -> None:
+    if _is_oversized_request(user_message):
+        say(
+            text=(
+                "*Agent 1 — Thin Slicer*\n\n"
+                "This request spans too many concerns to ship safely as a single change.\n\n"
+                "_Shape Up: a good slice ships in 1–2 days and stays green in isolation. "
+                "This request has too many moving parts for that._\n\n"
+                "*Pick one of these to start:*\n"
+                "• What is the single most important change here?\n"
+                "• Which part breaks production if you ship nothing else?\n"
+                "• Start with the data model change, then layer behaviour on top\n\n"
+                "Refine your request to a single concern and I'll scope it properly."
+            ),
+            thread_ts=thread_ts,
+        )
+        return
+
     repo_path = resolve_repo_path(DEFAULT_TARGET_REPO)
     state = HackathonAppState(user_request=user_message, target_repo=repo_path)
 

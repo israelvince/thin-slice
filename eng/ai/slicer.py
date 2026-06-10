@@ -29,8 +29,8 @@ def slice_repo(target_repo_path: str, keywords: List[str]) -> dict:
             "what", "which", "who", "how", "when", "where", "why",
             "all", "each", "every", "some", "any", "no", "not", "but", "or", "if",
             "then", "so", "up", "out", "about", "into", "than", "more", "also",
-            "just", "file", "files", "code", "main", "top", "new", "get", "set",
-            "make", "run", "use", "using", "used", "comment", "comments",
+            "just", "file", "files", "code", "top", "new", "get", "set",
+            "make", "run", "use", "using", "used",
             "explaining", "explain", "existing", "current", "update", "change",
             "changes", "create", "remove", "delete", "fix", "implement",
         }

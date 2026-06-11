@@ -342,19 +342,27 @@ def post_token_ledger(say, thread_ts: str, state: HackathonAppState, ledger: dic
 # ── Agent 3 — Risk Assessment ─────────────────────────────────────────────────
 
 _OVERSIZED_SIGNALS = {
-    "entire", "redesign", "real-time", "real time", "streaming", "dashboard",
-    "comprehensive", "complete feature", "across every", "across all", "weekly summary",
-    "aggregation pipeline", "event tracking", "reporting module",
-    "every file", "codebase", "centralized", "retry logic", "exponential backoff",
+    "entire codebase", "every service", "every file", "every pipeline",
+    "redesign", "real-time", "real time",
+    "comprehensive", "complete feature", "across every", "across all",
+    "weekly summary", "reporting module", "retry logic", "exponential backoff",
 }
 
 
 
 def _is_oversized_request(user_request: str) -> bool:
     req = user_request.lower()
+
+    # If the request explicitly names specific files (.py), the user has already
+    # done the scoping — accept it regardless of length or comma count.
+    if re.search(r'\b\w+\.py\b', req):
+        return False
+
+    # Without named files: check for genuine vagueness + breadth signals.
     signal_hits = sum(1 for w in _OVERSIZED_SIGNALS if w in req)
-    scope_indicators = req.count(",") + req.count(" and ")
-    return signal_hits >= 2 or scope_indicators >= 5
+    # Count " and " only — commas just mean someone is being precise.
+    scope_breadth = req.count(" and ")
+    return signal_hits >= 3 or (signal_hits >= 2 and scope_breadth >= 5)
 
 
 def _extract_change_subject(user_request: str) -> Optional[str]:

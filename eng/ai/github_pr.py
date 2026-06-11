@@ -4,7 +4,7 @@ import os
 import subprocess
 import tempfile
 import uuid
-from typing import Dict
+from typing import Dict, Optional
 
 logger = logging.getLogger("thin_slice.github_pr")
 
@@ -52,7 +52,7 @@ def _has_remote(path: str) -> bool:
         return False
 
 
-def _gh_create_pr(repo_path: str, branch: str, changes: Dict[str, str]) -> str | None:
+def _gh_create_pr(repo_path: str, branch: str, changes: Dict[str, str]) -> Optional[str]:
     try:
         subprocess.run(
             ["git", "-C", repo_path, "checkout", "-b", branch],

@@ -1,8 +1,50 @@
 import logging
 import os
+import re as _re
 from typing import List
 
 logger = logging.getLogger("thin_slice.slicer")
+
+KNOWN_ENTITIES = {
+    "profile builder":       "profile_builder.py",
+    "export service":        "export_service.py",
+    "data quality reporter": "data_quality_reporter.py",
+    "customer aggregator":   "customer_aggregator.py",
+    "payment aggregator":    "payment_aggregator.py",
+    "review aggregator":     "review_aggregator.py",
+    "ltv calculator":        "ltv_calculator.py",
+    "churn scorer":          "churn_scorer.py",
+    "risk classifier":       "risk_classifier.py",
+    "segment classifier":    "segment_classifier.py",
+    "profile validator":     "profile_validator.py",
+    "payment validator":     "payment_validator.py",
+    "order validator":       "order_validator.py",
+    "review validator":      "review_validator.py",
+    "config":                "config.py",
+    "logger":                "logger.py",
+    "scheduler":             "scheduler.py",
+    "storage connector":     "storage_connector.py",
+}
+
+
+def extract_mentioned_files(user_request: str, repo_path: str) -> list:
+    """Find files explicitly named in the request by filename or known entity name."""
+    request_lower = user_request.lower()
+    py_files = set(_re.findall(r'\b([\w]+\.py)\b', request_lower))
+    entity_matches = {
+        filename for entity, filename in KNOWN_ENTITIES.items()
+        if entity in request_lower
+    }
+    all_targets = py_files | entity_matches
+    if not all_targets:
+        return []
+    found = []
+    for root, dirs, files in os.walk(repo_path):
+        for f in files:
+            if f.lower() in all_targets:
+                found.append(os.path.relpath(os.path.join(root, f), repo_path))
+    return found
+
 
 _SKIP_DIRS = {
     ".venv", "venv", ".env", "__pycache__", ".git",
@@ -14,7 +56,7 @@ _MAX_FILES = 30
 _SNIPPET_CHARS = 3000
 
 
-def slice_repo(target_repo_path: str, keywords: List[str]) -> dict:
+def slice_repo(target_repo_path: str, keywords: List[str], user_request: str = "") -> dict:
     """Walk the repo and return files that contain any keyword.
 
     Skips vendor/cache directories and caps results to avoid token explosion.
@@ -49,6 +91,23 @@ def slice_repo(target_repo_path: str, keywords: List[str]) -> dict:
     affected = []
     snippets = []
     scored_files = []
+
+    # Pre-seed files explicitly named in the request (bypass keyword threshold)
+    entity_paths: set = set()
+    if user_request:
+        for rel in extract_mentioned_files(user_request, target_repo_path):
+            if rel in entity_paths:
+                continue
+            entity_paths.add(rel)
+            try:
+                with open(os.path.join(target_repo_path, rel), "r", encoding="utf-8") as fh:
+                    txt = fh.read()
+                affected.append(rel)
+                snippets.append(f"# FILE: {rel}\n{txt[:_SNIPPET_CHARS]}")
+                scored_files.append((rel, 10, txt))
+                logger.debug("Entity pre-seeded: %s", rel)
+            except Exception:
+                continue
 
     for root, dirs, files in os.walk(target_repo_path):
         dirs[:] = [

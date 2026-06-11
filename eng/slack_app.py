@@ -61,8 +61,11 @@ def _estimate_token_cost(
 
     n = max(file_count, 1)
     ctx_per_file = max(ctx_tokens // n, 50)
-    # Each file generates roughly 1.5× its input context in new code; cap at 2 000 tokens/file
-    output_per_file = min(int(ctx_per_file * 1.5), 2000)
+    # Output scales with request complexity: a short "add a docstring" request
+    # generates less code than a long cross-file migration request.
+    # req_mult: 1 token/word baseline = 1.0×; long complex requests go up to 4×.
+    req_mult = min(max(req_tokens / 15.0, 0.5), 4.0)
+    output_per_file = min(int(ctx_per_file * req_mult), 2000)
     output_tokens = output_per_file * n
 
     model_id, model_desc = _price_recommend(input_tokens + output_tokens)

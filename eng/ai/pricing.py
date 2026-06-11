@@ -25,9 +25,10 @@ def calculate_cost(input_tokens: int, model: str) -> float:
     return (input_tokens * input_price) + (output_tokens * output_price)
 
 
-def recommend_model(input_tokens: int) -> Tuple[str, str]:
-    if input_tokens < 500:
-        return CLAUDE_HAIKU_45, "small change — fastest and cheapest"
-    if input_tokens < 2000:
-        return CLAUDE_SONNET_46, "medium change — best quality/cost balance"
-    return GEMINI_15_PRO, "large change — best value for high token count"
+def recommend_model(total_tokens: int) -> Tuple[str, str]:
+    """Recommend a model based on total (input + output) token count."""
+    if total_tokens < 1_000:
+        return CLAUDE_HAIKU_45, "annotation/tiny change — fastest and cheapest"
+    if total_tokens < 10_000:
+        return CLAUDE_SONNET_46, "balanced — best quality/cost for this size"
+    return GEMINI_15_PRO, "large context — best value above 10 k tokens"

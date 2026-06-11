@@ -21,7 +21,7 @@ def planner(state: HackathonAppState) -> HackathonAppState:
     repo_path = state.target_repo
     keywords = _extract_keywords(state.user_request)
     if os.path.isdir(repo_path):
-        res = slice_repo(repo_path, keywords)
+        res = slice_repo(repo_path, keywords, user_request=state.user_request)
         state.affected_files = res.get("affected_files", [])
         state.extracted_slice_context = res.get("extracted_slice_context", "")
     else:

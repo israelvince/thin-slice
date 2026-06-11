@@ -44,10 +44,31 @@ def _blast_radius_score(files: List[str], graph: Dict[str, List[str]]) -> int:
     return sum(1 for f in files for deps in graph.values() if f in deps)
 
 
-def _structural_token_estimate(context: str, user_request: str) -> int:
+def _estimate_token_cost(
+    context: str, user_request: str, file_count: int
+) -> Tuple[int, int, float, str]:
+    """Return (input_tokens, output_tokens, cost_usd, model_label).
+
+    input_tokens  — what the model reads (context + request + system overhead)
+    output_tokens — what the model generates (per-file estimate at 1.5× input share, capped 2k/file)
+    cost_usd      — real dollar cost using the recommended model's per-token pricing
+    model_label   — human-readable model name for display
+    """
+    from ai.pricing import MODEL_PRICING, recommend_model as _price_recommend
     ctx_tokens = estimate_tokens(context)
     req_tokens = estimate_tokens(user_request)
-    return int((ctx_tokens + req_tokens + 500) * 1.4)
+    input_tokens = ctx_tokens + req_tokens + 500  # 500 = system prompt overhead
+
+    n = max(file_count, 1)
+    ctx_per_file = max(ctx_tokens // n, 50)
+    # Each file generates roughly 1.5× its input context in new code; cap at 2 000 tokens/file
+    output_per_file = min(int(ctx_per_file * 1.5), 2000)
+    output_tokens = output_per_file * n
+
+    model_id, model_desc = _price_recommend(input_tokens + output_tokens)
+    inp_price, out_price = MODEL_PRICING[model_id]
+    cost = (input_tokens * inp_price) + (output_tokens * out_price)
+    return input_tokens, output_tokens, round(cost, 6), f"{model_id} ({model_desc})"
 
 
 if not SLACK_BOT_TOKEN or not SLACK_APP_TOKEN:
@@ -166,32 +187,47 @@ def _make_pr(state: HackathonAppState) -> Optional[str]:
 # ── Slack post helpers ────────────────────────────────────────────────────────
 
 def post_slices_identified(say, thread_ts: str, state: HackathonAppState, token_count: Optional[int] = None) -> None:
+    file_count = len(state.affected_files or [])
+    inp, out, cost, model_label = _estimate_token_cost(
+        state.extracted_slice_context or state.user_request,
+        state.user_request,
+        file_count,
+    )
     if token_count is None:
-        token_count = estimate_tokens(state.extracted_slice_context or state.user_request)
-    # Agent 1 consumes the slice context only — not the inflated structural estimate
-    _a1_tokens = estimate_tokens(state.extracted_slice_context or state.user_request)
+        token_count = inp
+    # Agent 1 reads the slice context only — charge at Haiku input rate
+    from ai.pricing import MODEL_PRICING, CLAUDE_HAIKU_45
+    _a1_tokens = estimate_tokens(state.extracted_slice_context or "")
+    _a1_cost = _a1_tokens * MODEL_PRICING[CLAUDE_HAIKU_45][0]
     say(
         text=(
             "*Agent 1 — Thin Slicer*\n"
             f"Files affected:\n{format_file_list(state.affected_files)}\n"
-            f"Estimated tokens: *{token_count:,}*\n"
-            f"_Used tokens: {_a1_tokens:,}_"
+            f"In: *{inp:,}* | Out (gen): *{out:,}* | Total: *{inp+out:,}* tokens\n"
+            f"_Used tokens: {_a1_tokens:,} (${_a1_cost:.6f})_"
         ),
         thread_ts=thread_ts,
     )
 
 
 def post_cost_estimate(say, thread_ts: str, state: HackathonAppState, token_count: int) -> None:
-    complexity = token_count / _BUDGET_THRESHOLD
     file_count = len(state.affected_files or [])
-    # Agent 2 re-reads the same slice context as Agent 1 (overhead is token-cost, not raw count)
-    _a2_tokens = estimate_tokens(state.extracted_slice_context or "")
+    inp, out, cost, model_label = _estimate_token_cost(
+        state.extracted_slice_context or state.user_request,
+        state.user_request,
+        file_count,
+    )
+    complexity = inp / _BUDGET_THRESHOLD
+    from ai.pricing import MODEL_PRICING, CLAUDE_HAIKU_45
+    _a2_tokens = 200  # optimizer overhead: reads model tier and decides
+    _a2_cost = _a2_tokens * MODEL_PRICING[CLAUDE_HAIKU_45][0]
     say(
         text=(
             "*Agent 2 — Model Optimizer*\n"
-            f"Files: *{file_count}* | Complexity: *{complexity:.1f}x* safe-ship threshold | Tokens: *{token_count:,}*\n"
-            f"Recommended model: {recommend_model(token_count)}\n"
-            f"_Used tokens: {_a2_tokens:,}_"
+            f"Files: *{file_count}* | Complexity: *{complexity:.1f}x* safe-ship threshold\n"
+            f"In: *{inp:,}* | Out (gen): *{out:,}* | Est. cost: *${cost:.4f}*\n"
+            f"Recommended model: {model_label}\n"
+            f"_Used tokens: {_a2_tokens:,} (${_a2_cost:.6f})_"
         ),
         thread_ts=thread_ts,
     )
@@ -226,6 +262,7 @@ def post_generated_code(say, thread_ts: str, state: HackathonAppState, ledger: O
 
 
 def post_token_ledger(say, thread_ts: str, state: HackathonAppState, ledger: dict) -> None:
+    from ai.pricing import MODEL_PRICING, CLAUDE_HAIKU_45, CLAUDE_SONNET_46
     total_tokens = sum(v["tokens"] for v in ledger.values())
     total_cost = sum(v["cost_usd"] for v in ledger.values())
 
@@ -233,7 +270,12 @@ def post_token_ledger(say, thread_ts: str, state: HackathonAppState, ledger: dic
         total_files = sum(1 for _, _, fs in os.walk(state.target_repo) for _ in fs)
     except Exception:
         total_files = len(state.affected_files or [])
-    full_regen_cost = total_files * 0.0008
+    # Full regen estimate: every file read as input + generated as output at Sonnet prices
+    avg_tokens_per_file = 500
+    _fr_inp = total_files * avg_tokens_per_file
+    _fr_out = total_files * avg_tokens_per_file
+    _inp_p, _out_p = MODEL_PRICING[CLAUDE_SONNET_46]
+    full_regen_cost = (_fr_inp * _inp_p) + (_fr_out * _out_p)
 
     agent_rows = [
         ("Agent 1 — Slicer",         ledger["agent_1_slicer"]),
@@ -489,18 +531,24 @@ def post_budget_check(say, thread_ts: str, token_count: int) -> None:
             sum(snippets.get(f, "").count("\n") + 1 if snippets.get(f) else 10 for f in non_readme),
             5,
         ), 150)
+        _fp_inp, _fp_out, _fp_cost, _ = _estimate_token_cost(
+            state.extracted_slice_context or "", state.user_request, len(non_readme)
+        )
+        from ai.pricing import MODEL_PRICING, CLAUDE_HAIKU_45 as _H45
+        _fp_a3_cost = round(200 * MODEL_PRICING[_H45][0], 6)
         say(
             text=(
                 f"*Agent 3 — Risk Assessment* _(triggered by {trigger_reason})_\n\n"
-                f"📐 ~{_fast_total_lines} lines across {len(non_readme)} files"
-                f" | Tokens: *{token_count:,}* | Risk: *{overall_risk}*\n\n"
+                f"~{_fast_total_lines} lines across {len(non_readme)} files"
+                f" | In: *{_fp_inp:,}* Out: *{_fp_out:,}* | Est. cost: *${_fp_cost:.4f}*"
+                f" | Risk: *{overall_risk}*\n\n"
                 f"{risk_explanation}\n\n"
                 "_Shape Up: this change is atomic and self-contained — it ships in one go and can be "
                 "verified in isolation. No slicing needed._\n\n"
                 "*Verdict:* Safe to ship as-is.\n\n"
                 "*Reply to select:*\n"
                 "*go* — ship it | *no go* — cancel\n\n"
-                "_Used tokens: 200_"
+                f"_Used tokens: 200 (${_fp_a3_cost:.6f})_"
             ),
             thread_ts=thread_ts,
         )
@@ -528,43 +576,49 @@ def post_budget_check(say, thread_ts: str, token_count: int) -> None:
 
     # ── INVEST-compliant vertical slice generation ────────────────────────────
 
-    # Step 1: Split strictly by layer — contract/enum → 1, pipeline/service → 2, tests → 3
-    slice1_files = [f for f in non_readme if "models/" in f or "contracts/" in f]
-    slice2_files = [f for f in non_readme if "pipelines/" in f or "services/" in f]
-    slice3_files = [f for f in non_readme if (
-        "tests/" in f
-        or os.path.basename(f).startswith("test_")
-        or "/test_" in f
-    )]
-    assigned = set(slice1_files + slice2_files + slice3_files)
+    # Assign each file to its semantic layer: 1=schema/contract, 2=logic/validation, 3=tests
+    layer_bins: Dict[int, List[str]] = {1: [], 2: [], 3: []}
     for f in non_readme:
-        if f not in assigned:
+        if "models/" in f or "contracts/" in f:
+            layer_bins[1].append(f)
+        elif "tests/" in f or os.path.basename(f).startswith("test_") or "/test_" in f:
+            layer_bins[3].append(f)
+        elif "pipelines/" in f or "services/" in f:
+            layer_bins[2].append(f)
+        else:
             cat = folder_category(f)
             if cat == "models":
-                slice1_files.append(f)
+                layer_bins[1].append(f)
             elif cat == "tests":
-                slice3_files.append(f)
+                layer_bins[3].append(f)
             else:
-                slice2_files.append(f)
+                layer_bins[2].append(f)
 
-    # Store all three layer lists so "slice N" replies map correctly by fixed index
-    pending_slice_maps[thread_ts] = [slice1_files, slice2_files, slice3_files]
+    # Fallback: when layer 1 (schema) is empty and layer 2 has >=3 files, use dep-graph
+    # to promote files that others import into "effective layer 1" (the unspoken contract)
+    if not layer_bins[1] and len(layer_bins[2]) >= 3:
+        g = _dep_graph(layer_bins[2])
+        roots = [f for f in layer_bins[2]
+                 if any(f in g.get(other, []) for other in layer_bins[2] if other != f)]
+        if roots:
+            layer_bins[1] = roots
+            layer_bins[2] = [f for f in layer_bins[2] if f not in roots]
 
-    # Only display non-empty slices, preserving their 1/2/3 layer numbers
-    layer_slices = [
-        (idx, fs)
-        for idx, fs in ((1, slice1_files), (2, slice2_files), (3, slice3_files))
-        if fs
+    # Build sequential display list — skip empty layers, renumber 1,2,3 from the top
+    # Each entry: (display_num, semantic_layer, files)
+    ordered = [(sem, layer_bins[sem]) for sem in (1, 2, 3) if layer_bins[sem]]
+    display_slices: List[Tuple[int, int, List[str]]] = [
+        (i + 1, sem, fs) for i, (sem, fs) in enumerate(ordered)
     ]
 
-    # Step 2: Real line counts — sum of actual lines per file, no cap
-    def _count_lines(fs: List[str]) -> int:
-        return sum(
-            snippets[f].count("\n") + 1 if snippets.get(f) else 10
-            for f in fs
-        )
+    # Store in display order: "slice 1" → first shown slice, "slice 2" → second, etc.
+    pending_slice_maps[thread_ts] = [fs for _, _, fs in display_slices]
 
-    # Step 3: Extract new_value, condition, class name, and entity from request
+    # ── Helpers ───────────────────────────────────────────────────────────────
+
+    def _count_lines(fs: List[str]) -> int:
+        return sum(snippets[f].count("\n") + 1 if snippets.get(f) else 10 for f in fs)
+
     def _extract_new_value(request: str) -> str:
         caps = [w for w in re.findall(r'\b[A-Z][A-Z0-9_]*\b', request) if '_' in w or len(w) >= 4]
         return max(caps, key=len) if caps else ""
@@ -609,9 +663,9 @@ def post_budget_check(say, thread_ts: str, token_count: int) -> None:
     def _to_field_name(cls: str) -> str:
         return re.sub(r'(?<!^)(?=[A-Z])', '_', cls).lower() + 's'
 
-    # Step 3 cont.: Specific "What ships" per slice
-    def _what_ships(layer_idx: int, files: List[str]) -> str:
-        if layer_idx == 1:
+    # "What ships" description for each semantic layer
+    def _what_ships(semantic: int, files: List[str]) -> str:
+        if semantic == 1:
             if new_value and class_name:
                 return (
                     f"The {class_name} enum includes {new_value} — "
@@ -620,12 +674,12 @@ def post_budget_check(say, thread_ts: str, token_count: int) -> None:
             if new_value:
                 return f"The contract defines {new_value} — downstream code can import it immediately"
             return "The data contract is defined — downstream code can import it immediately"
-        if layer_idx == 2:
+        if semantic == 2:
             pipeline = _pipeline_name(files)
             if new_value:
                 return f"The {pipeline} sets {new_value} when {condition}"
             return f"The {pipeline} implements the logic when {condition}"
-        if layer_idx == 3:
+        if semantic == 3:
             if new_value:
                 return (
                     f"Automated tests verify {new_value} is set correctly "
@@ -634,40 +688,53 @@ def post_budget_check(say, thread_ts: str, token_count: int) -> None:
             return "Automated tests verify the new behavior and existing behavior is unchanged"
         return "Delivers a verifiable outcome"
 
-    # Step 4: INVEST check per slice
-    def _invest_check(layer_idx: int) -> str:
-        if layer_idx == 1:
-            return "✅ Independent (no dependencies)"
-        if layer_idx == 2:
-            first = class_name or (
-                os.path.basename(slice1_files[0]) if slice1_files else "Slice 1 contract"
-            )
-            return f"✅ Independent after Slice 1 | Slice 1 must ship: {first}"
-        if layer_idx == 3:
-            return "✅ Independent (tests can always ship last)"
+    # INVEST independence check, referenced by display number
+    def _invest_check(display_num: int, semantic: int) -> str:
+        if semantic == 1:
+            return "✅ Independent — no other slice must land first"
+        if semantic == 2:
+            if display_num > 1:
+                anchor = class_name or (
+                    os.path.basename(display_slices[0][2][0]) if display_slices[0][2] else "Slice 1"
+                )
+                return f"✅ Ships after Slice 1 | Needs: {anchor}"
+            return "✅ Independent — no schema dependency detected"
+        if semantic == 3:
+            return "✅ Independent — tests always ship last, never block"
         return "✅ Independent"
 
-    # Step 5: Testability hint per slice
-    def _testability_hint(layer_idx: int, files: List[str]) -> str:
+    # Testability hint
+    def _testability_hint(semantic: int, files: List[str]) -> str:
         cls = class_name or "Enum"
         val = new_value or "NEW_VALUE"
-        if layer_idx == 1:
+        if semantic == 1:
             module = _slice1_module_path(files)
             return (
                 f"Testable: `from {module} import {cls}; "
-                f"assert '{val}' in [f.value for f in {cls}]`"
+                f"assert '{val}' in [m.value for m in {cls}]`"
             )
-        if layer_idx == 2:
+        if semantic == 2:
             entity_plural = _entity + "s"
             field = _to_field_name(class_name) if class_name else val.lower() + "s"
             return (
                 f"Testable: pass empty {entity_plural} list, "
                 f"assert `{val}` in profile.{field}"
             )
-        if layer_idx == 3:
+        if semantic == 3:
             return "Testable: run `pytest tests/` and all new cases pass"
-        return "Testable: run targeted tests for this layer"
+        return "Testable: run targeted tests"
 
+    # ── Per-slice cost estimate (using real pricing) ──────────────────────────
+    from ai.pricing import MODEL_PRICING, CLAUDE_SONNET_46 as _SONNET
+    _inp_p, _out_p = MODEL_PRICING[_SONNET]
+
+    def _slice_cost(fs: List[str]) -> str:
+        ctx = sum(estimate_tokens(snippets.get(f, "")) for f in fs)
+        out = min(int(ctx * 1.5), 2000 * len(fs))
+        cost = (ctx * _inp_p) + (out * _out_p)
+        return f"${cost:.4f}"
+
+    # ── Build slice output lines ──────────────────────────────────────────────
     readme_note = (
         f"\n\nUpdate README.md to reflect the `{subject_label}` change once slices land."
         if readme_files else ""
@@ -675,30 +742,56 @@ def post_budget_check(say, thread_ts: str, token_count: int) -> None:
     trigger_reason = "shipping risk" if token_count <= _BUDGET_THRESHOLD else "token budget"
 
     slice_lines: List[str] = []
-    for layer_idx, files_in_slice in layer_slices:
+    for display_num, semantic, files_in_slice in display_slices:
         files_str = ", ".join(f"`{os.path.basename(f)}`" for f in files_in_slice)
         line_count = _count_lines(files_in_slice)
+        cost_label = _slice_cost(files_in_slice)
         slice_lines.append(
-            f"*Slice {layer_idx}*\n"
+            f"*Slice {display_num}*\n"
             f"Files: {files_str}\n"
-            f"What ships: {_what_ships(layer_idx, files_in_slice)}\n"
-            f"INVEST: {_invest_check(layer_idx)}\n"
-            f"{_testability_hint(layer_idx, files_in_slice)} | 📐 ~{line_count} lines"
+            f"What ships: {_what_ships(semantic, files_in_slice)}\n"
+            f"INVEST: {_invest_check(display_num, semantic)}\n"
+            f"{_testability_hint(semantic, files_in_slice)} | ~{line_count} lines | Est. cost: {cost_label}"
         )
 
-    # Step 6: Smart move line
-    s1_lines = _count_lines(slice1_files) if slice1_files else 0
-    smart_move = (
-        f"*Smart move:* Slice 1 is {s1_lines} lines of code — ship it in minutes. "
-        "Slice 2 is the real feature — ship it once Slice 1 is merged. "
-        "Slice 3 locks in the behavior — ship it before the sprint ends."
+    # ── Smart move — references only the slices that actually exist ───────────
+    if len(display_slices) == 1:
+        _, _, f1 = display_slices[0]
+        smart_move = (
+            f"*Smart move:* Ship Slice 1 ({_count_lines(f1)} lines) — "
+            "self-contained, ships and verifies in one cycle."
+        )
+    elif len(display_slices) == 2:
+        _, _, f1 = display_slices[0]
+        _, _, f2 = display_slices[1]
+        smart_move = (
+            f"*Smart move:* Slice 1 ({_count_lines(f1)} lines) first — "
+            f"verify in prod, then Slice 2 ({_count_lines(f2)} lines). "
+            "Each is independently deployable."
+        )
+    else:
+        _, _, f1 = display_slices[0]
+        smart_move = (
+            f"*Smart move:* Slice 1 ({_count_lines(f1)} lines) is the contract — "
+            "ship it first so Slices 2 and 3 have something to import. "
+            "Each slice verifies green before the next one ships."
+        )
+
+    # ── Total cost for the full change ────────────────────────────────────────
+    _total_inp, _total_out, _total_cost, _ = _estimate_token_cost(
+        state.extracted_slice_context or "", state.user_request, len(non_readme)
     )
+    from ai.pricing import MODEL_PRICING as _MP, CLAUDE_SONNET_46 as _S46
+    _a3_ctx = estimate_tokens(state.extracted_slice_context or "")
+    _a3_tokens = _a3_ctx + 800
+    _a3_cost = round(_a3_tokens * _MP[_S46][0], 6)
 
     say(
         text=(
             f"*Agent 3 — Risk Assessment* _(triggered by {trigger_reason})_\n\n"
-            f"📐 ~{_count_lines(non_readme)} lines across {len(non_readme)} files"
-            f" | Tokens: *{token_count:,}* | Risk: *{overall_risk}* | Blast radius: *{blast_label}*\n\n"
+            f"~{_count_lines(non_readme)} lines across {len(non_readme)} files"
+            f" | In: *{_total_inp:,}* Out: *{_total_out:,}* | Est. cost: *${_total_cost:.4f}*"
+            f" | Risk: *{overall_risk}* | Blast radius: *{blast_label}*\n\n"
             f"{risk_explanation}\n\n"
             f"{knowledge_note}\n\n"
             "*Verdict:* Too risky to ship as a single PR.\n\nThese are the recommended slices:\n\n"
@@ -708,7 +801,7 @@ def post_budget_check(say, thread_ts: str, token_count: int) -> None:
             + "\n\n*Reply to select:*\n"
             "*go* — ship everything | *no go* — cancel | "
             "*slice 1*, *slice 2*, *slice 1 2*, *slice 1 2 3* — pick specific slices\n\n"
-            "_Used tokens: 200_"
+            f"_Used tokens: {_a3_tokens:,} (${_a3_cost:.6f})_"
         ),
         thread_ts=thread_ts,
     )
@@ -724,9 +817,27 @@ def _run_generator_and_pr(state: HackathonAppState) -> HackathonAppState:
 
 
 def run_pipeline(say, channel: str, thread_ts: str, user_message: str) -> None:
+    if _is_oversized_request(user_message):
+        say(
+            text=(
+                "*Agent 1 — Thin Slicer*\n\n"
+                "This request spans too many concerns to ship safely as a single change.\n\n"
+                "_Shape Up: a good slice ships in 1–2 days and stays green in isolation. "
+                "This request has too many moving parts for that._\n\n"
+                "*Pick one of these to start:*\n"
+                "• What is the single most important change here?\n"
+                "• Which part breaks production if you ship nothing else?\n"
+                "• Start with the data model change, then layer behaviour on top\n\n"
+                "Refine your request to a single concern and I'll scope it properly."
+            ),
+            thread_ts=thread_ts,
+        )
+        return
 
     repo_path = resolve_repo_path(DEFAULT_TARGET_REPO)
     state = HackathonAppState(user_request=user_message, target_repo=repo_path)
+
+    from ai.pricing import MODEL_PRICING, CLAUDE_HAIKU_45, CLAUDE_SONNET_46
 
     ledger: Dict[str, Dict] = {
         "agent_1_slicer":    {"tokens": 0, "cost_usd": 0.0},
@@ -739,24 +850,31 @@ def run_pipeline(say, channel: str, thread_ts: str, user_message: str) -> None:
     state = pipeline.optimizer(state)
     state = pipeline.estimator(state)
 
-    # Agent 1: tokens from the extracted slice context
-    a1_tokens = estimate_tokens(state.extracted_slice_context or "")
-    ledger["agent_1_slicer"]["tokens"] = a1_tokens
-
-    # Agent 2: same token base; cost is optimizer overhead fraction of projected cost
-    projected_cost = getattr(state, "projected_token_cost_usd", 0.0) or 0.0
-    a2_cost = projected_cost * 0.15
-    ledger["agent_2_optimizer"]["tokens"] = a1_tokens
-    ledger["agent_2_optimizer"]["cost_usd"] = a2_cost
-
-    # Agent 3: fixed-size risk assessment prompt
-    ledger["agent_3_risk"]["tokens"] = 200
-    ledger["agent_3_risk"]["cost_usd"] = 200 * 0.000003
-
-    # Single source of truth: calculated once after estimator, shared by all three posting functions
-    token_count = _structural_token_estimate(
-        state.extracted_slice_context or "", state.user_request
+    file_count = len(state.affected_files or [])
+    inp, out, est_cost, _model_label = _estimate_token_cost(
+        state.extracted_slice_context or "", user_message, file_count
     )
+    # token_count is input-only — used for budget threshold comparison
+    token_count = inp
+
+    # Agent 1: reads the slice context at Haiku rates (search + scan, no generation)
+    a1_tokens = estimate_tokens(state.extracted_slice_context or "")
+    a1_cost = a1_tokens * MODEL_PRICING[CLAUDE_HAIKU_45][0]
+    ledger["agent_1_slicer"]["tokens"] = a1_tokens
+    ledger["agent_1_slicer"]["cost_usd"] = round(a1_cost, 6)
+
+    # Agent 2: 200-token optimizer decision at Haiku rates
+    a2_tokens = 200
+    a2_cost = a2_tokens * MODEL_PRICING[CLAUDE_HAIKU_45][0]
+    ledger["agent_2_optimizer"]["tokens"] = a2_tokens
+    ledger["agent_2_optimizer"]["cost_usd"] = round(a2_cost, 6)
+
+    # Agent 3: reads full context + request to analyse risk at Sonnet rates
+    a3_tokens = a1_tokens + 800  # context + analysis overhead
+    a3_cost = a3_tokens * MODEL_PRICING[CLAUDE_SONNET_46][0]
+    ledger["agent_3_risk"]["tokens"] = a3_tokens
+    ledger["agent_3_risk"]["cost_usd"] = round(a3_cost, 6)
+
     post_slices_identified(say, thread_ts, state, token_count)
     post_cost_estimate(say, thread_ts, state, token_count)
 
@@ -777,10 +895,14 @@ def run_pipeline(say, channel: str, thread_ts: str, user_message: str) -> None:
 
     state = _run_generator_and_pr(state)
 
-    # Agent 4: tokens from generated output; cost is projected minus optimizer overhead
-    a4_tokens = estimate_tokens(str(state.generated_code_blocks or {}))
+    # Agent 4: real cost = input context + generated output at Sonnet rates
+    a4_in_tokens = a1_tokens  # reads the same context
+    a4_out_tokens = estimate_tokens(str(state.generated_code_blocks or {}))
+    a4_tokens = a4_in_tokens + a4_out_tokens
+    _inp_p, _out_p = MODEL_PRICING[CLAUDE_SONNET_46]
+    a4_cost = (a4_in_tokens * _inp_p) + (a4_out_tokens * _out_p)
     ledger["agent_4_generator"]["tokens"] = a4_tokens
-    ledger["agent_4_generator"]["cost_usd"] = max(projected_cost - a2_cost, 0.0)
+    ledger["agent_4_generator"]["cost_usd"] = round(a4_cost, 6)
 
     post_generated_code(say, thread_ts, state, ledger)
 
@@ -875,8 +997,9 @@ def handle_budget_reply(message, say, logger):
         post_slices_identified(say, thread_ts, state)
         state = pipeline.optimizer(state)
         state = pipeline.estimator(state)
-        token_count = _structural_token_estimate(
-            state.extracted_slice_context or "", state.user_request
+        token_count, _, _, _ = _estimate_token_cost(
+            state.extracted_slice_context or "", state.user_request,
+            len(state.affected_files or [])
         )
         post_cost_estimate(say, thread_ts, state, token_count)
 

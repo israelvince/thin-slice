@@ -425,6 +425,17 @@ def _shipping_risk_triggered(files: List[str], snippets: Dict[str, str]) -> bool
     return overall_risk == "HIGH"
 
 
+def _slice_reply_options(display_slices: list) -> str:
+    """Build the 'Reply to select' line showing only the slice numbers that exist."""
+    nums = [str(d) for d, _, _ in display_slices]
+    parts = ["*go* — ship everything", "*no go* — cancel"]
+    if nums:
+        parts.append("*slice " + "*, *slice ".join(nums) + "* — pick specific slices")
+        if len(nums) > 1:
+            parts.append(f"*slice {' '.join(nums)}* — ship all slices together")
+    return " | ".join(parts)
+
+
 def post_budget_check(say, thread_ts: str, token_count: int) -> None:
     state: Optional[HackathonAppState] = next(
         (s for (_, ts), s in pending_budget_checks.items() if ts == thread_ts),
@@ -583,8 +594,16 @@ def post_budget_check(say, thread_ts: str, token_count: int) -> None:
     def _count_lines(fs: List[str]) -> int:
         return sum(snippets[f].count("\n") + 1 if snippets.get(f) else 10 for f in fs)
 
+    _GENERIC_TECH_WORDS = {
+        "JSON", "HTTP", "REST", "API", "UUID", "CSV", "SQL", "XML", "HTML",
+        "TRUE", "FALSE", "NONE", "NULL", "SRE", "CRM", "LTV", "ETL",
+    }
+
     def _extract_new_value(request: str) -> str:
-        caps = [w for w in re.findall(r'\b[A-Z][A-Z0-9_]*\b', request) if '_' in w or len(w) >= 4]
+        caps = [
+            w for w in re.findall(r'\b[A-Z][A-Z0-9_]*\b', request)
+            if ('_' in w or len(w) >= 4) and w not in _GENERIC_TECH_WORDS
+        ]
         return max(caps, key=len) if caps else ""
 
     def _extract_condition(request: str) -> str:
@@ -627,8 +646,30 @@ def post_budget_check(say, thread_ts: str, token_count: int) -> None:
     def _to_field_name(cls: str) -> str:
         return re.sub(r'(?<!^)(?=[A-Z])', '_', cls).lower() + 's'
 
-    # "What ships" description for each semantic layer
+    # Detect request intent once — drives description framing below
+    _req_lower = state.user_request.lower()
+    _is_logging_req = any(w in _req_lower for w in (
+        "log ", "logging", "logger", "structured json", "log when", "log if",
+        "observability", "structured log", "json log",
+    ))
+    _is_annotation_req = _is_annotation_request(state.user_request)
+    _is_null_req = any(w in _req_lower for w in (
+        "missing", "gracefully", "default to 0", "none check", "null", "no reviews",
+    ))
+
+    # "What ships" — intent-aware so logging/null/enum each get the right framing
     def _what_ships(semantic: int, files: List[str]) -> str:
+        file_names = ", ".join(f"`{os.path.basename(f)}`" for f in files)
+        if _is_logging_req:
+            return (
+                f"Structured JSON logging added to {file_names} via `infra/logger.py` — "
+                "each event emits `pipeline_run_id`, timing, and per-pipeline metric fields"
+            )
+        if _is_null_req:
+            return (
+                f"{file_names} handles missing/null data gracefully — "
+                "defaults applied, no ZeroDivisionError on empty input"
+            )
         if semantic == 1:
             if new_value and class_name:
                 return (
@@ -641,18 +682,15 @@ def post_budget_check(say, thread_ts: str, token_count: int) -> None:
         if semantic == 2:
             pipeline = _pipeline_name(files)
             if new_value:
-                return f"The {pipeline} sets {new_value} when {condition}"
-            return f"The {pipeline} implements the logic when {condition}"
+                return f"The {pipeline} enforces {new_value} when {condition}"
+            return f"The {pipeline} implements the updated logic"
         if semantic == 3:
             if new_value:
-                return (
-                    f"Automated tests verify {new_value} is set correctly "
-                    "and existing behavior is unchanged"
-                )
-            return "Automated tests verify the new behavior and existing behavior is unchanged"
+                return f"Tests verify {new_value} behaves correctly and existing cases are unchanged"
+            return "Tests verify the new behavior and guard against regressions"
         return "Delivers a verifiable outcome"
 
-    # INVEST independence check, referenced by display number
+    # INVEST independence check
     def _invest_check(display_num: int, semantic: int) -> str:
         if semantic == 1:
             return "✅ Independent — no other slice must land first"
@@ -667,8 +705,16 @@ def post_budget_check(say, thread_ts: str, token_count: int) -> None:
             return "✅ Independent — tests always ship last, never block"
         return "✅ Independent"
 
-    # Testability hint
+    # Testability hint — intent-aware
     def _testability_hint(semantic: int, files: List[str]) -> str:
+        if _is_logging_req:
+            file_names = " + ".join(f"`{os.path.basename(f)}`" for f in files)
+            return (
+                f"Testable: run the pipeline, check stdout for JSON lines with "
+                f"`\"pipeline_run_id\"` from {file_names}"
+            )
+        if _is_null_req:
+            return "Testable: call with empty input — assert result is 0 or None, no exception raised"
         cls = class_name or "Enum"
         val = new_value or "NEW_VALUE"
         if semantic == 1:
@@ -681,11 +727,11 @@ def post_budget_check(say, thread_ts: str, token_count: int) -> None:
             entity_plural = _entity + "s"
             field = _to_field_name(class_name) if class_name else val.lower() + "s"
             return (
-                f"Testable: pass empty {entity_plural} list, "
-                f"assert `{val}` in profile.{field}"
+                f"Testable: pass a profile with `{val}` set, "
+                f"assert `{field}` is correct"
             )
         if semantic == 3:
-            return "Testable: run `pytest tests/` and all new cases pass"
+            return "Testable: run `pytest tests/` — all new cases pass"
         return "Testable: run targeted tests"
 
     # ── Per-slice cost estimate (using real pricing) ──────────────────────────
@@ -763,9 +809,8 @@ def post_budget_check(say, thread_ts: str, token_count: int) -> None:
             + "\n\n" + smart_move
             + readme_note
             + "\n\n*Reply to select:*\n"
-            "*go* — ship everything | *no go* — cancel | "
-            "*slice 1*, *slice 2*, *slice 1 2*, *slice 1 2 3* — pick specific slices\n\n"
-            f"_Used tokens: {_a3_tokens:,} (${_a3_cost:.6f})_"
+            + _slice_reply_options(display_slices)
+            + f"\n\n_Used tokens: {_a3_tokens:,} (${_a3_cost:.6f})_"
         ),
         thread_ts=thread_ts,
     )

@@ -194,23 +194,20 @@ def _make_pr(state: HackathonAppState) -> Optional[str]:
 
 def post_slices_identified(say, thread_ts: str, state: HackathonAppState, token_count: Optional[int] = None) -> None:
     file_count = len(state.affected_files or [])
-    inp, out, cost, model_label = _estimate_token_cost(
+    inp, _, _, _ = _estimate_token_cost(
         state.extracted_slice_context or state.user_request,
         state.user_request,
         file_count,
     )
     if token_count is None:
         token_count = inp
-    # Agent 1 reads the slice context only — charge at Haiku input rate
-    from ai.pricing import MODEL_PRICING, CLAUDE_HAIKU_45
     _a1_tokens = estimate_tokens(state.extracted_slice_context or "")
-    _a1_cost = _a1_tokens * MODEL_PRICING[CLAUDE_HAIKU_45][0]
     say(
         text=(
             "*Agent 1 — Thin Slicer*\n"
             f"Files affected:\n{format_file_list(state.affected_files)}\n"
-            f"In: *{inp:,}* | Out (gen): *{out:,}* | Total: *{inp+out:,}* tokens\n"
-            f"_Used tokens: {_a1_tokens:,} (${_a1_cost:.6f})_"
+            f"Estimated tokens: *{token_count:,}*\n"
+            f"_Used tokens: {_a1_tokens:,}_"
         ),
         thread_ts=thread_ts,
     )
@@ -218,22 +215,14 @@ def post_slices_identified(say, thread_ts: str, state: HackathonAppState, token_
 
 def post_cost_estimate(say, thread_ts: str, state: HackathonAppState, token_count: int) -> None:
     file_count = len(state.affected_files or [])
-    inp, out, cost, model_label = _estimate_token_cost(
-        state.extracted_slice_context or state.user_request,
-        state.user_request,
-        file_count,
-    )
-    complexity = inp / _BUDGET_THRESHOLD
-    from ai.pricing import MODEL_PRICING, CLAUDE_HAIKU_45
-    _a2_tokens = 200  # optimizer overhead: reads model tier and decides
-    _a2_cost = _a2_tokens * MODEL_PRICING[CLAUDE_HAIKU_45][0]
+    complexity = token_count / _BUDGET_THRESHOLD
+    _a2_tokens = 200
     say(
         text=(
             "*Agent 2 — Model Optimizer*\n"
-            f"Files: *{file_count}* | Complexity: *{complexity:.1f}x* safe-ship threshold\n"
-            f"In: *{inp:,}* | Out (gen): *{out:,}* | Est. cost: *${cost:.4f}*\n"
-            f"Recommended model: {model_label}\n"
-            f"_Used tokens: {_a2_tokens:,} (${_a2_cost:.6f})_"
+            f"Files: *{file_count}* | Complexity: *{complexity:.1f}x* safe-ship threshold | Tokens: *{token_count:,}*\n"
+            f"Recommended model: {recommend_model(token_count)}\n"
+            f"_Used tokens: {_a2_tokens:,}_"
         ),
         thread_ts=thread_ts,
     )
@@ -352,10 +341,6 @@ def post_token_ledger(say, thread_ts: str, state: HackathonAppState, ledger: dic
 
 # ── Agent 3 — Risk Assessment ─────────────────────────────────────────────────
 
-_ANNOTATION_WORDS = {
-    "log", "logging", "print", "comment", "docstring", "debug", "trace", "print statement"
-}
-
 _OVERSIZED_SIGNALS = {
     "entire", "redesign", "real-time", "real time", "streaming", "dashboard",
     "comprehensive", "complete feature", "across every", "across all", "weekly summary",
@@ -363,9 +348,6 @@ _OVERSIZED_SIGNALS = {
     "every file", "codebase", "centralized", "retry logic", "exponential backoff",
 }
 
-
-def _is_annotation_request(user_request: str) -> bool:
-    return any(w in user_request.lower() for w in _ANNOTATION_WORDS)
 
 
 def _is_oversized_request(user_request: str) -> bool:
@@ -527,38 +509,6 @@ def post_budget_check(say, thread_ts: str, token_count: int) -> None:
         + (f"\n{blast_note}" if blast_note else "")
         + (f"\n{coupling_warning}" if coupling_warning else "")
     )
-
-    # ── Simple change fast-path: no slicing needed ───────────────────────────
-    _annotation = _is_annotation_request(state.user_request)
-    if (overall_risk == "LOW" or (_annotation and len(non_readme) == 1)) and blast_radius == 0 and not coupled:
-        pending_slice_maps[thread_ts] = [non_readme]
-        trigger_reason = "shipping risk" if token_count <= _BUDGET_THRESHOLD else "token budget"
-        _fast_total_lines = min(max(
-            sum(snippets.get(f, "").count("\n") + 1 if snippets.get(f) else 10 for f in non_readme),
-            5,
-        ), 150)
-        _fp_inp, _fp_out, _fp_cost, _ = _estimate_token_cost(
-            state.extracted_slice_context or "", state.user_request, len(non_readme)
-        )
-        from ai.pricing import MODEL_PRICING, CLAUDE_HAIKU_45 as _H45
-        _fp_a3_cost = round(200 * MODEL_PRICING[_H45][0], 6)
-        say(
-            text=(
-                f"*Agent 3 — Risk Assessment* _(triggered by {trigger_reason})_\n\n"
-                f"~{_fast_total_lines} lines across {len(non_readme)} files"
-                f" | In: *{_fp_inp:,}* Out: *{_fp_out:,}* | Est. cost: *${_fp_cost:.4f}*"
-                f" | Risk: *{overall_risk}*\n\n"
-                f"{risk_explanation}\n\n"
-                "_Shape Up: this change is atomic and self-contained — it ships in one go and can be "
-                "verified in isolation. No slicing needed._\n\n"
-                "*Verdict:* Safe to ship as-is.\n\n"
-                "*Reply to select:*\n"
-                "*go* — ship it | *no go* — cancel\n\n"
-                f"_Used tokens: 200 (${_fp_a3_cost:.6f})_"
-            ),
-            thread_ts=thread_ts,
-        )
-        return
 
     # ── Knowledge note ────────────────────────────────────────────────────────
     if overall_risk == "HIGH" and coupled:
@@ -890,15 +840,15 @@ def run_pipeline(say, channel: str, thread_ts: str, user_message: str) -> None:
             first_line, _, rest = chunk.partition("\n")
             snippets[first_line.strip()] = rest
 
-    cost_triggered = token_count > _BUDGET_THRESHOLD or not state.policy_clearance
     risk_triggered = _shipping_risk_triggered(state.affected_files, snippets)
 
-    if cost_triggered or risk_triggered:
+    if risk_triggered:
         state.policy_clearance = False
         pending_budget_checks[(channel, thread_ts)] = state
         post_budget_check(say, thread_ts, token_count)
         return
 
+    state.policy_clearance = True
     state = _run_generator_and_pr(state)
 
     # Agent 4: real cost = input context + generated output at Sonnet rates

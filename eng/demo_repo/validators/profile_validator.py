@@ -52,8 +52,3 @@ def validate_all(profiles) -> List[ValidationResult]:
     """Validate every profile and return a result per profile."""
     return [validate_profile(p) for p in profiles.values()]
 
-# Updated by Thin-Slice
-
-# Updated by Thin-Slice
-
-# Updated by Thin-Slice

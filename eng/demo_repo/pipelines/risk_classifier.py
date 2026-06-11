@@ -57,8 +57,3 @@ def summarise_risk_distribution(profiles) -> dict:
         counts[p.risk_level] = counts.get(p.risk_level, 0) + 1
     return counts
 
-# Updated by Thin-Slice
-
-# Updated by Thin-Slice
-
-# Updated by Thin-Slice

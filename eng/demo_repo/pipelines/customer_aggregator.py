@@ -96,8 +96,3 @@ def aggregate_profiles(profiles: Dict[str, CustomerProfile], orders: Dict[str, O
         if plist:
             profile.preferred_payment_type = max(set(plist), key=plist.count)
 
-# Updated by Thin-Slice
-
-# Updated by Thin-Slice
-
-# Updated by Thin-Slice

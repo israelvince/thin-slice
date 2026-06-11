@@ -93,29 +93,9 @@ def generator(state: HackathonAppState) -> HackathonAppState:
 
 
 def _build_changes(state: HackathonAppState) -> dict:
-    # Try real LLM first
-    llm_output = generate_code(
-        state.user_request,
-        state.extracted_slice_context,
-        state.selected_model_tier,
-    )
-    if llm_output:
-        target = (
-            state.affected_files[0]
-            if state.affected_files and state.affected_files[0] != "<unspecified>"
-            else "generated/changes.py"
-        )
-        logger.info("Generator: LLM produced output for %s", target)
-        return {target: llm_output}
+    files = [f for f in (state.affected_files or []) if f != "<unspecified>"]
 
-    # No LLM available — use smart rule-based generation
-    import os as _os
-    repo_name = _os.path.basename(_os.path.abspath(state.target_repo))
-    if repo_name == "sandbox_repo":
-        return _cltv_changes()
-
-    # Parse snippets for smart generator
-    from .services.demo_generator import generate as smart_generate
+    # Parse per-file snippets upfront — used by both paths
     snippets: dict = {}
     for chunk in ("\n" + (state.extracted_slice_context or "")).split("\n# FILE: "):
         if not chunk.strip():
@@ -123,9 +103,31 @@ def _build_changes(state: HackathonAppState) -> dict:
         first_line, _, rest = chunk.partition("\n")
         snippets[first_line.strip()] = rest
 
+    # Sandbox repo has its own dedicated generator
+    import os as _os
+    if _os.path.basename(_os.path.abspath(state.target_repo)) == "sandbox_repo":
+        return _cltv_changes()
+
+    # Try LLM for every affected file — one focused API call per file so the
+    # model sees only that file's context and can produce a complete replacement
+    if files:
+        changes: dict = {}
+        for f in files:
+            file_ctx = f"# FILE: {f}\n{snippets.get(f, '')}"
+            out = generate_code(state.user_request, file_ctx, state.selected_model_tier)
+            if out:
+                changes[f] = out
+        if changes:
+            logger.info(
+                "Generator: LLM produced output for %d/%d file(s)", len(changes), len(files)
+            )
+            return changes
+
+    # No LLM — rule-based smart generator
+    from .services.demo_generator import generate as smart_generate
     result = smart_generate(
         state.user_request,
-        state.affected_files or [],
+        files or ["<unspecified>"],
         snippets,
         state.target_repo,
     )

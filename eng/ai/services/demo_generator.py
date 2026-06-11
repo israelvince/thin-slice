@@ -77,7 +77,7 @@ def generate(
         return {}
 
     if intent == "logging":
-        return _apply_logging(files[0], snippets, repo_path, user_request)
+        return _apply_logging(files, snippets, repo_path, user_request)
     if intent == "print_statement":
         return _apply_print_statement(files[0], snippets, repo_path, user_request)
     if intent == "error_handling":
@@ -98,6 +98,21 @@ def generate(
 # ── Logging transformation ────────────────────────────────────────────────────
 
 def _apply_logging(
+    files: List[str],
+    snippets: Dict[str, str],
+    repo_path: str,
+    request: str,
+) -> Dict[str, str]:
+    """Apply structured JSON logging to every affected file."""
+    changes: Dict[str, str] = {}
+    for filepath in files:
+        result = _apply_logging_to_file(filepath, snippets, repo_path, request)
+        if result:
+            changes.update(result)
+    return changes
+
+
+def _apply_logging_to_file(
     filepath: str,
     snippets: Dict[str, str],
     repo_path: str,
@@ -107,75 +122,238 @@ def _apply_logging(
     if not content:
         return {}
 
-    # Extract threshold constant name from request (e.g. CHURN_RISK_THRESHOLD)
-    caps_match = re.search(r'\b([A-Z][A-Z0-9_]{4,})\b', request)
-    threshold = caps_match.group(1) if caps_match else None
-
+    base = os.path.basename(filepath)
     lines = content.splitlines()
+
+    # ── Step 1: upgrade imports ───────────────────────────────────────────────
+    # Remove old-style logging imports; inject the structured logger + uuid/time
     result: List[str] = []
+    logger_injected = False
+    last_import_idx = -1
+    for i, ln in enumerate(lines):
+        if ln.startswith("import ") or ln.startswith("from "):
+            last_import_idx = i
 
-    # Ensure logging is imported
-    has_import = any("import logging" in ln for ln in lines)
-    has_logger = any("getLogger" in ln for ln in lines)
+    for i, ln in enumerate(lines):
+        # Drop bare `import logging` and plain getLogger logger lines — we replace them
+        if ln.strip() == "import logging":
+            continue
+        if re.match(r'^logger\s*=\s*logging\.getLogger', ln.strip()):
+            continue
+        result.append(ln)
+        if i == last_import_idx and not logger_injected:
+            result.append("import time")
+            result.append("import uuid")
+            result.append("from demo_repo.infra.logger import get_logger")
+            result.append("")
+            result.append("logger = get_logger(__name__)")
+            logger_injected = True
 
-    if not has_import:
-        inserted = False
-        for ln in lines:
-            if not inserted and (ln.startswith("import ") or ln.startswith("from ")):
-                result.append("import logging")
-                inserted = True
-            result.append(ln)
-        lines = result
-        result = []
+    if not logger_injected:
+        # No imports found — prepend everything
+        header = [
+            "import time",
+            "import uuid",
+            "from demo_repo.infra.logger import get_logger",
+            "",
+            "logger = get_logger(__name__)",
+            "",
+        ]
+        result = header + result
 
-    if not has_logger:
-        inserted = False
-        last_import_idx = 0
-        for i, ln in enumerate(lines):
-            if ln.startswith("import ") or ln.startswith("from "):
-                last_import_idx = i
-        for i, ln in enumerate(lines):
-            result.append(ln)
-            if i == last_import_idx and not inserted:
-                result.append("")
-                result.append("logger = logging.getLogger(__name__)")
-                inserted = True
-        lines = result
-        result = []
+    lines = result
 
-    # Find the threshold comparison and inject log statement after it
+    # ── Step 2: file-specific instrumentation ─────────────────────────────────
+    if "churn_scorer" in base:
+        lines = _instrument_churn_scorer(lines)
+    elif "customer_aggregator" in base:
+        lines = _instrument_aggregator(lines)
+    elif "risk_classifier" in base:
+        lines = _instrument_risk_classifier(lines)
+    elif "profile_validator" in base or "validator" in base:
+        lines = _instrument_validator(lines)
+    else:
+        lines = _instrument_generic(lines, base)
+
+    return {filepath: "\n".join(lines) + "\n"}
+
+
+def _instrument_churn_scorer(lines: List[str]) -> List[str]:
+    """Log when a customer's churn score exceeds CHURN_RISK_THRESHOLD."""
+    result: List[str] = []
     i = 0
     while i < len(lines):
         line = lines[i]
         result.append(line)
-
-        stripped = line.strip()
-        is_threshold_check = (
-            threshold
-            and threshold in line
-            and (">" in line or ">=" in line)
-            and stripped.startswith("if ")
-        )
-
-        if is_threshold_check:
+        # After `if risk > CHURN_RISK_THRESHOLD:` inject the structured log
+        if (
+            re.search(r'if\s+\w+\s*[>]=?\s*CHURN_RISK_THRESHOLD', line)
+            and line.strip().startswith("if ")
+        ):
             indent = len(line) - len(line.lstrip())
-            body_indent = " " * (indent + 4)
-
-            # Find the loop variable (customer_id, record_id, etc.) from context
+            body = " " * (indent + 4)
             id_var = _find_loop_var(lines, i)
-            # Find the score variable name from the condition
-            var_match = re.search(r'if\s+(\w+)\s*(?:>|>=)', line)
-            score_var = var_match.group(1) if var_match else "score"
-
-            result.append(f"{body_indent}logger.warning(")
-            result.append(f'{body_indent}    "Customer %s exceeded {threshold}: '
-                          f'score=%.2f threshold=%.2f",')
-            result.append(f"{body_indent}    {id_var}, {score_var}, {threshold},")
-            result.append(f"{body_indent})")
-
+            var_match = re.search(r'if\s+(\w+)\s*[>]=?', line)
+            score_var = var_match.group(1) if var_match else "risk"
+            result.append(
+                f'{body}logger.warning("churn_risk_threshold_exceeded", extra={{'
+            )
+            result.append(f'{body}    "pipeline_run_id": str(uuid.uuid4()),')
+            result.append(f'{body}    "customer_id": {id_var},')
+            result.append(f'{body}    "churn_score": round({score_var}, 4),')
+            result.append(f'{body}    "threshold": CHURN_RISK_THRESHOLD,')
+            result.append(f'{body}}})')
         i += 1
+    return result
 
-    return {filepath: "\n".join(result) + "\n"}
+
+def _instrument_aggregator(lines: List[str]) -> List[str]:
+    """Wrap aggregate_profiles with start/end timing and customer count logging."""
+    result: List[str] = []
+    in_fn = False
+    fn_indent = 0
+    run_id_injected = False
+
+    for line in lines:
+        fn_match = re.match(r'^(\s*)def aggregate_profiles\(', line)
+        if fn_match:
+            in_fn = True
+            fn_indent = len(fn_match.group(1))
+            run_id_injected = False
+            result.append(line)
+            continue
+
+        if in_fn and not run_id_injected:
+            # Inject pipeline_run_id + start-time log right after the def line
+            # (skip blank lines and docstring first)
+            stripped = line.strip()
+            if stripped and not stripped.startswith('"""') and not stripped.startswith("'''"):
+                body = " " * (fn_indent + 4)
+                result.append(f'{body}_run_id = str(uuid.uuid4())')
+                result.append(f'{body}_t0 = time.time()')
+                result.append(
+                    f'{body}logger.info("aggregate_profiles_start", extra={{'
+                    f'"pipeline_run_id": _run_id, "profiles": len(profiles)}})'
+                )
+                run_id_injected = True
+                result.append(line)
+                continue
+            result.append(line)
+
+            # Detect end of function: return or last statement at same indent level
+            if stripped.startswith("return") or (
+                stripped
+                and len(line) - len(line.lstrip()) == fn_indent + 4
+                and not stripped.startswith("#")
+                and result and result[-1].strip() == ""
+            ):
+                pass
+            continue
+
+        result.append(line)
+
+    # Append end-of-run log before the final blank line
+    _inject_aggregator_end(result, fn_indent)
+    return result
+
+
+def _inject_aggregator_end(lines: List[str], fn_indent: int) -> None:
+    """Append the completion log after the last line of aggregate_profiles."""
+    body = " " * (fn_indent + 4)
+    insert_after = -1
+    # Scan backwards for the last non-blank, non-comment line at ANY depth
+    # inside the function (indent >= fn_indent + 4)
+    for i in range(len(lines) - 1, -1, -1):
+        stripped = lines[i].strip()
+        if stripped and not stripped.startswith("#"):
+            indent = len(lines[i]) - len(lines[i].lstrip())
+            if indent >= fn_indent + 4:
+                insert_after = i
+                break
+    if insert_after >= 0:
+        completion_log = [
+            "",
+            f'{body}logger.info("aggregate_profiles_complete", extra={{',
+            f'{body}    "pipeline_run_id": _run_id,',
+            f'{body}    "customers_processed": len(profiles),',
+            f'{body}    "duration_ms": int((time.time() - _t0) * 1000),',
+            f'{body}}})',
+        ]
+        for j, ln in enumerate(completion_log):
+            lines.insert(insert_after + 1 + j, ln)
+
+
+def _instrument_risk_classifier(lines: List[str]) -> List[str]:
+    """Log the risk distribution summary after apply_risk_classification."""
+    result: List[str] = []
+    in_fn = False
+    fn_indent = 0
+
+    for line in lines:
+        fn_match = re.match(r'^(\s*)def apply_risk_classification\(', line)
+        if fn_match:
+            in_fn = True
+            fn_indent = len(fn_match.group(1))
+        result.append(line)
+
+        if in_fn and "profile.risk_level = level" in line:
+            body = " " * (fn_indent + 4)
+            result.append("")
+            result.append(f'{body}logger.info("risk_classified", extra={{')
+            result.append(f'{body}    "pipeline_run_id": str(uuid.uuid4()),')
+            result.append(f'{body}    "customer_id": profile.customer_id,')
+            result.append(f'{body}    "risk_level": level,')
+            result.append(f'{body}}})')
+            in_fn = False
+
+    return result
+
+
+def _instrument_validator(lines: List[str]) -> List[str]:
+    """Log invalid profiles at validation time."""
+    result: List[str] = []
+    in_fn = False
+    fn_indent = 0
+
+    for line in lines:
+        fn_match = re.match(r'^(\s*)def validate_profile\(', line)
+        if fn_match:
+            in_fn = True
+            fn_indent = len(fn_match.group(1))
+        result.append(line)
+
+        if in_fn and "return ValidationResult" in line and "is_valid" in line:
+            body = " " * (fn_indent + 4)
+            result.append(f'{body}if errors:')
+            result.append(f'{body}    logger.warning("profile_validation_failed", extra={{')
+            result.append(f'{body}        "pipeline_run_id": str(uuid.uuid4()),')
+            result.append(f'{body}        "customer_id": profile.customer_id,')
+            result.append(f'{body}        "errors": errors,')
+            result.append(f'{body}    }})')
+            in_fn = False
+
+    return result
+
+
+def _instrument_generic(lines: List[str], base: str) -> List[str]:
+    """For files without a specific handler: log entry/exit of the first public function."""
+    result: List[str] = []
+    injected = False
+
+    for line in lines:
+        result.append(line)
+        if not injected:
+            fn_match = re.match(r'^(\s*)def ([a-z]\w+)\(', line)
+            if fn_match:
+                indent = fn_match.group(1)
+                fn_name = fn_match.group(2)
+                body = indent + "    "
+                result.append(f'{body}logger.info("{fn_name}_start", extra={{')
+                result.append(f'{body}    "pipeline_run_id": str(uuid.uuid4()),')
+                result.append(f'{body}}})')
+                injected = True
+
+    return result
 
 
 def _find_loop_var(lines: List[str], from_idx: int) -> str:

@@ -46,8 +46,3 @@ class CustomerProfile:
             f"risk={self.risk_level}"
         )
 
-# Updated by Thin-Slice
-
-# Updated by Thin-Slice
-
-# Updated by Thin-Slice

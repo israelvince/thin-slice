@@ -24,7 +24,7 @@ SLACK_BOT_TOKEN = os.environ.get("SLACK_BOT_TOKEN")
 SLACK_APP_TOKEN = os.environ.get("SLACK_APP_TOKEN")
 DEFAULT_TARGET_REPO = os.environ.get("SLACK_TARGET_REPO", "./demo_repo")
 
-_BUDGET_THRESHOLD = int(os.environ.get("THIN_SLICE_TOKEN_THRESHOLD", "1500"))
+_BUDGET_THRESHOLD = int(os.environ.get("THIN_SLICE_TOKEN_THRESHOLD", "3000"))
 
 _MINS_PER_FILE = {"HIGH": 30, "MEDIUM": 20, "LOW": 12}
 _COUPLING_OVERHEAD_MINS = 30
@@ -194,19 +194,20 @@ def _make_pr(state: HackathonAppState) -> Optional[str]:
 
 def post_slices_identified(say, thread_ts: str, state: HackathonAppState, token_count: Optional[int] = None) -> None:
     file_count = len(state.affected_files or [])
-    inp, _, _, _ = _estimate_token_cost(
+    input_tokens, output_tokens, _, _ = _estimate_token_cost(
         state.extracted_slice_context or state.user_request,
         state.user_request,
         file_count,
     )
     if token_count is None:
-        token_count = inp
+        token_count = input_tokens + output_tokens
+    agent_1_tokens_used = len(state.user_request) // 4
     say(
         text=(
             "*Agent 1 — Thin Slicer*\n"
             f"Files affected:\n{format_file_list(state.affected_files)}\n"
-            f"Estimated tokens for change: *{token_count:,}*\n"
-            f"`Tokens used by Agent 1: {len(state.user_request) // 4:,}`"
+            f"Estimated tokens for change: *{token_count:,}* ({input_tokens:,} in · {output_tokens:,} out)\n"
+            f"`Tokens used by Agent 1: {agent_1_tokens_used:,}`"
         ),
         thread_ts=thread_ts,
     )
@@ -1054,7 +1055,7 @@ def post_budget_check(say, thread_ts: str, token_count: int) -> None:
         text=(
             "*Agent 3 — Risk Assessment*\n"
             f"~{_count_lines(non_readme)} lines across {len(non_readme)} files | "
-            f"Tokens: {token_count:,}/{_BUDGET_THRESHOLD:,} | "
+            f"Estimated tokens for change: {token_count:,}/{_BUDGET_THRESHOLD:,} | "
             f"Strategy: {strategy_label}\n"
             "\n"
             f"Coupling: *{assessment['coupling']}* | "
@@ -1105,8 +1106,8 @@ def run_pipeline(say, channel: str, thread_ts: str, user_message: str) -> None:
     inp, out, est_cost, _model_label = _estimate_token_cost(
         state.extracted_slice_context or "", user_message, file_count
     )
-    # token_count is input-only — used for budget threshold comparison
-    token_count = inp
+    # token_count = input + output — single source of truth for budget comparison
+    token_count = inp + out
 
     # Agent 1: reads the slice context at Haiku rates (search + scan, no generation)
     a1_tokens = estimate_tokens(state.extracted_slice_context or "")

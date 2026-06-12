@@ -785,6 +785,18 @@ def post_budget_check(say, thread_ts: str, token_count: int) -> None:
     else:
         pending_slice_maps[thread_ts] = [fs for _, _, fs in display_slices]
 
+    # When all files collapse into one layer/slice but the assessment wants more,
+    # split them round-robin across slice_count groups so the reply flow works.
+    if len(display_slices) == 1 and assessment["slice_count"] > 1:
+        single_files = display_slices[0][2]
+        n = min(assessment["slice_count"], len(single_files))
+        if n > 1:
+            groups: List[List[str]] = [[] for _ in range(n)]
+            for idx, f in enumerate(single_files):
+                groups[idx % n].append(f)
+            display_slices = [(i + 1, 2, grp) for i, grp in enumerate(groups) if grp]
+            pending_slice_maps[thread_ts] = [grp for _, _, grp in display_slices]
+
     # ── LLM slice generation (OpenAI) — overrides deterministic if available ──
     _llm_result = _generate_slices_with_llm(assessment, non_readme, snippets, state.user_request)
     if _llm_result is not None:
@@ -1035,6 +1047,8 @@ def post_budget_check(say, thread_ts: str, token_count: int) -> None:
         "risk-first": "Risk-first slice",
     }
     strategy_label = _strategy_labels.get(assessment["strategy"], "Layer slice")
+    if not _llm_slices:
+        strategy_label += " · deterministic"
 
     say(
         text=(

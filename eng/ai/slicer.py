@@ -46,6 +46,53 @@ def extract_mentioned_files(user_request: str, repo_path: str) -> list:
     return found
 
 
+_BROAD_SCOPE_SIGNALS = {
+    "entire codebase", "all files", "every model",
+    "every file", "every service", "every pipeline",
+}
+
+
+def extract_field_referenced_files(user_request: str, repo_path: str) -> list:
+    """Find files that contain any snake_case field names mentioned in the request.
+
+    Used as a fallback when extract_mentioned_files returns nothing — handles
+    broad requests like 'update all files using total_spend_brl and ltv_brl'.
+    """
+    import re as _re
+
+    # Extract snake_case identifiers from the request (likely field/variable names)
+    field_candidates = set(_re.findall(r'\b[a-z][a-z0-9]*(?:_[a-z0-9]+){1,}\b', user_request.lower()))
+
+    # Filter out common English words that happen to have underscores in this context
+    if not field_candidates:
+        return []
+
+    found = []
+    for root, dirs, files in os.walk(repo_path):
+        if '.git' in root or '__pycache__' in root:
+            continue
+        for f in files:
+            if not f.endswith('.py'):
+                continue
+            filepath = os.path.join(root, f)
+            try:
+                with open(filepath, encoding='utf-8') as fh:
+                    content = fh.read().lower()
+                if any(field in content for field in field_candidates):
+                    rel = os.path.relpath(filepath, repo_path)
+                    found.append(rel)
+            except Exception:
+                continue
+
+    if any(sig in user_request.lower() for sig in _BROAD_SCOPE_SIGNALS) and len(found) > 25:
+        logger.warning(
+            "Broad-scope request matched %d files via field search; capping at 25", len(found)
+        )
+        found = sorted(found)[:25]
+
+    return found
+
+
 _SKIP_DIRS = {
     ".venv", "venv", ".env", "__pycache__", ".git",
     "node_modules", ".pytest_cache", "dist", "build",
@@ -92,10 +139,14 @@ def slice_repo(target_repo_path: str, keywords: List[str], user_request: str = "
     snippets = []
     scored_files = []
 
-    # Pre-seed files explicitly named in the request (bypass keyword threshold)
+    # Pre-seed files explicitly named in the request (bypass keyword threshold).
+    # Fall back to field-name content matching when no explicit files are named.
     entity_paths: set = set()
     if user_request:
-        for rel in extract_mentioned_files(user_request, target_repo_path):
+        mentioned = extract_mentioned_files(user_request, target_repo_path)
+        if not mentioned:
+            mentioned = extract_field_referenced_files(user_request, target_repo_path)
+        for rel in mentioned:
             if rel in entity_paths:
                 continue
             entity_paths.add(rel)

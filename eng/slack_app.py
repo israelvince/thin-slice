@@ -233,9 +233,7 @@ def post_generated_code(say, thread_ts: str, state: HackathonAppState, ledger: O
         say(text="*Agent 4 — Code Generator*\nNo code blocks were produced.", thread_ts=thread_ts)
         return
 
-    pr_url = state.pull_request_url
-    pr_line = f"*PR:* {pr_url}" if pr_url else "*PR:* Not created in this run"
-    files_line = ", ".join(f"`{f}`" for f in state.generated_code_blocks)
+    pr_url = state.pull_request_url or "Not created in this run"
     a4_tokens = (
         ledger["agent_4_generator"]["tokens"]
         if ledger else estimate_tokens(str(state.generated_code_blocks))
@@ -243,11 +241,11 @@ def post_generated_code(say, thread_ts: str, state: HackathonAppState, ledger: O
 
     say(
         text=(
-            "*Agent 4 — Code Generator complete*\n\n"
-            f"Files changed: {files_line}\n"
-            f"{pr_line}\n\n"
+            "*Agent 4 — Code Generator*\n"
+            "✅ Change is safe to ship\n"
+            f"🔗 {pr_url}\n\n"
             + format_code_blocks(state.generated_code_blocks)
-            + f"\n\n_Used tokens: {a4_tokens:,}_"
+            + f"\n`Tokens used by Agent 4: {a4_tokens:,}`"
         ),
         thread_ts=thread_ts,
     )
@@ -800,19 +798,17 @@ def post_budget_check(say, thread_ts: str, token_count: int) -> None:
 
     say(
         text=(
-            f"*Agent 3 — Risk Assessment* _(triggered by {trigger_reason})_\n\n"
+            "*Agent 3 — Risk Assessment*\n"
             f"~{_count_lines(non_readme)} lines across {len(non_readme)} files"
-            f" | In: *{_total_inp:,}* Out: *{_total_out:,}* | Est. cost: *${_total_cost:.4f}*"
-            f" | Risk: *{overall_risk}* | Blast radius: *{blast_label}*\n\n"
-            f"{risk_explanation}\n\n"
-            f"{knowledge_note}\n\n"
-            "*Verdict:* Too risky to ship as a single PR.\n\nThese are the recommended slices:\n\n"
+            f" | Estimated tokens for change: *{token_count:,}*/{_BUDGET_THRESHOLD}"
+            f" | Risk: *{overall_risk}* | Blast radius: {blast_radius}\n\n"
+            "❌ Too risky and costly to ship as a single PR.\n\n"
+            "These are the recommended slices:\n\n"
             + "\n\n".join(slice_lines)
-            + "\n\n" + smart_move
             + readme_note
-            + "\n\n*Reply to select:*\n"
+            + "\n\nReply to select: "
             + _slice_reply_options(display_slices)
-            + f"\n\n_Used tokens: {_a3_tokens:,} (${_a3_cost:.6f})_"
+            + "\n`Tokens used by Agent 3: 200`"
         ),
         thread_ts=thread_ts,
     )

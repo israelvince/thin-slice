@@ -24,6 +24,8 @@ KNOWN_ENTITIES = {
     "logger":                "logger.py",
     "scheduler":             "scheduler.py",
     "storage connector":     "storage_connector.py",
+    "customer profile":      "customer_profile.py",
+    "data quality rules":    "data_quality_rules.py",
 }
 
 
@@ -43,6 +45,34 @@ def extract_mentioned_files(user_request: str, repo_path: str) -> list:
         for f in files:
             if f.lower() in all_targets:
                 found.append(os.path.relpath(os.path.join(root, f), repo_path))
+    return found
+
+
+def extract_constant_referenced_files(user_request: str, repo_path: str) -> list:
+    """Find files defining ALL_CAPS constants mentioned in the request."""
+    import re as _re
+    constants = set(_re.findall(r'\b[A-Z][A-Z0-9_]{3,}\b', user_request))
+    if not constants:
+        return []
+
+    found = []
+    for root, dirs, files in os.walk(repo_path):
+        if '.git' in root or '__pycache__' in root:
+            continue
+        for f in files:
+            if not f.endswith('.py'):
+                continue
+            filepath = os.path.join(root, f)
+            try:
+                with open(filepath, encoding='utf-8') as fh:
+                    content = fh.read()
+                for const in constants:
+                    if _re.search(rf'^{const}\s*[:=]', content, _re.MULTILINE):
+                        rel = os.path.relpath(filepath, repo_path)
+                        found.append(rel)
+                        break
+            except Exception:
+                continue
     return found
 
 
@@ -139,14 +169,13 @@ def slice_repo(target_repo_path: str, keywords: List[str], user_request: str = "
     snippets = []
     scored_files = []
 
-    # Pre-seed files explicitly named in the request (bypass keyword threshold).
-    # Fall back to field-name content matching when no explicit files are named.
+    # Pre-seed files from all three matchers combined (bypass keyword threshold).
     entity_paths: set = set()
     if user_request:
-        mentioned = extract_mentioned_files(user_request, target_repo_path)
-        if not mentioned:
-            mentioned = extract_field_referenced_files(user_request, target_repo_path)
-        for rel in mentioned:
+        mentioned = set(extract_mentioned_files(user_request, target_repo_path))
+        mentioned |= set(extract_constant_referenced_files(user_request, target_repo_path))
+        mentioned |= set(extract_field_referenced_files(user_request, target_repo_path))
+        for rel in sorted(mentioned):
             if rel in entity_paths:
                 continue
             entity_paths.add(rel)

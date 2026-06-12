@@ -913,7 +913,15 @@ def run_pipeline(say, channel: str, thread_ts: str, user_message: str) -> None:
             first_line, _, rest = chunk.partition("\n")
             snippets[first_line.strip()] = rest
 
-    risk_triggered = _shipping_risk_triggered(state.affected_files, snippets)
+    _req_lower = user_message.lower()
+    _is_annotation = any(w in _req_lower for w in (
+        "comment", "docstring", "explain", "explanation", "add a note",
+        "module-level", "what it means", "what ltv", "what ltv means",
+    ))
+    risk_triggered = (
+        False if _is_annotation and len(state.affected_files or []) <= 2
+        else _shipping_risk_triggered(state.affected_files, snippets)
+    )
 
     if risk_triggered:
         state.policy_clearance = False

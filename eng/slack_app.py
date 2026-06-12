@@ -356,14 +356,15 @@ _OVERSIZED_SIGNALS = {
 def _is_oversized_request(user_request: str) -> bool:
     req = user_request.lower()
 
-    # If the request explicitly names specific files (.py), the user has already
-    # done the scoping — accept it regardless of length or comma count.
-    if re.search(r'\b\w+\.py\b', req):
+    named_files = re.findall(r'\b\w+\.py\b', req)
+    # ≥4 named files means the change is cross-cutting — treat file count as a breadth signal
+    if len(named_files) >= 4:
+        return True
+    # 1–3 named files: user has scoped the change, bypass vagueness checks
+    if named_files:
         return False
 
-    # Without named files: check for genuine vagueness + breadth signals.
     signal_hits = sum(1 for w in _OVERSIZED_SIGNALS if w in req)
-    # Count " and " only — commas just mean someone is being precise.
     scope_breadth = req.count(" and ")
     return signal_hits >= 3 or (signal_hits >= 2 and scope_breadth >= 5)
 

@@ -526,6 +526,104 @@ def _slice_reply_options(display_slices: list) -> str:
     return " | ".join(parts)
 
 
+def _generate_slices_with_llm(
+    assessment: dict,
+    files: List[str],
+    snippets: Dict[str, str],
+    user_request: str,
+) -> Optional[tuple]:
+    """Call OpenAI to generate 1–5 intelligent slice recommendations.
+
+    Returns (slices, mvp_text) on success, None if unavailable or call fails.
+    slices: list of {num, name, goal, files, why_first}
+    """
+    api_key = os.environ.get("OPENAI_API_KEY")
+    if not api_key:
+        return None
+    try:
+        import openai as _openai
+    except ImportError:
+        logger.warning("openai package not installed; falling back to deterministic slicing")
+        return None
+
+    slice_count = assessment["slice_count"]
+    strategy    = assessment["strategy"]
+    file_summaries = "\n".join(
+        f"- {f}: {(snippets.get(f, '')[:400].strip() or '(no content)')}"
+        for f in files
+    )
+
+    system_prompt = (
+        "You are a Change Request Slicing Agent. Split a software change into safe, "
+        "thin, independently-deployable slices that each deliver real business value.\n\n"
+        "Respond with JSON only — no markdown, no prose outside the JSON object.\n"
+        'Schema: {"slices": [{"num": int, "name": str, "goal": str, '
+        '"files": [str], "why_first": str}], "mvp": str}\n\n'
+        "Rules:\n"
+        "- Each file appears in at most one slice. Every file must be assigned.\n"
+        "- name: 3–6 words, descriptive.\n"
+        "- goal: one sentence — what ships and why it matters to the business.\n"
+        "- why_first: one sentence on why this slice is ordered where it is.\n"
+        "- mvp: name the single best first slice and explain in one sentence why it "
+        "delivers the smallest meaningful business value with the safest validation path."
+    )
+
+    user_content = (
+        f"Change request:\n{user_request}\n\n"
+        f"Affected files and content:\n{file_summaries}\n\n"
+        "Risk assessment:\n"
+        f"  Coupling: {assessment['coupling']}\n"
+        f"  Business impact: {assessment['business_impact']}\n"
+        f"  Review complexity: {assessment['review_complexity']}\n"
+        f"  Reversibility: {assessment['reversibility']}\n"
+        f"  Confidence: {assessment['confidence']}\n"
+        f"  Strategy: {strategy}\n\n"
+        f"Recommend exactly {slice_count} slice(s) using a {strategy} strategy."
+    )
+
+    try:
+        client = _openai.OpenAI(api_key=api_key)
+        model = os.environ.get("OPENAI_SLICE_MODEL", "gpt-4o-mini")
+        resp = client.chat.completions.create(
+            model=model,
+            messages=[
+                {"role": "system", "content": system_prompt},
+                {"role": "user",   "content": user_content},
+            ],
+            response_format={"type": "json_object"},
+            max_tokens=1200,
+            temperature=0,
+        )
+        data = json.loads(resp.choices[0].message.content)
+        raw  = data.get("slices") or []
+        mvp  = str(data.get("mvp") or "")
+
+        slices = []
+        for i, s in enumerate(raw, 1):
+            slice_files = [f for f in (s.get("files") or []) if f in files]
+            slices.append({
+                "num":       i,
+                "name":      str(s.get("name") or f"Slice {i}"),
+                "goal":      str(s.get("goal") or ""),
+                "files":     slice_files,
+                "why_first": str(s.get("why_first") or ""),
+            })
+
+        # Guarantee every file is assigned to exactly one slice
+        assigned   = {f for s in slices for f in s["files"]}
+        unassigned = [f for f in files if f not in assigned]
+        if unassigned and slices:
+            slices[-1]["files"].extend(unassigned)
+        elif unassigned:
+            slices = [{"num": 1, "name": "Full change", "goal": "", "files": files, "why_first": ""}]
+
+        logger.info("LLM slicing: %d slice(s) via %s", len(slices), model)
+        return slices, mvp
+    except Exception as exc:
+        logger.warning("LLM slice generation failed (%s): %s", type(exc).__name__, exc)
+        return None
+
+
 def post_budget_check(say, thread_ts: str, token_count: int) -> None:
     state: Optional[HackathonAppState] = next(
         (s for (_, ts), s in pending_budget_checks.items() if ts == thread_ts),
@@ -686,6 +784,15 @@ def post_budget_check(say, thread_ts: str, token_count: int) -> None:
         pending_slice_maps[thread_ts] = [non_readme]
     else:
         pending_slice_maps[thread_ts] = [fs for _, _, fs in display_slices]
+
+    # ── LLM slice generation (OpenAI) — overrides deterministic if available ──
+    _llm_result = _generate_slices_with_llm(assessment, non_readme, snippets, state.user_request)
+    if _llm_result is not None:
+        _llm_slices, _mvp_text = _llm_result
+        display_slices = [(s["num"], 2, s["files"]) for s in _llm_slices if s["files"]]
+        pending_slice_maps[thread_ts] = [s["files"] for s in _llm_slices if s["files"]]
+    else:
+        _llm_slices, _mvp_text = [], ""
 
     # ── Helpers ───────────────────────────────────────────────────────────────
 
@@ -906,11 +1013,20 @@ def post_budget_check(say, thread_ts: str, token_count: int) -> None:
         verdict = "❌ Too risky and costly to ship as a single PR."
 
     valid_slices = [(dn, fs) for dn, _, fs in display_slices if fs]
-    slice_names_text = "\n".join(
-        f"*Slice {num}:* "
-        + os.path.basename(fs[0]).replace("_", " ").replace(".py", "").title()
-        for num, fs in valid_slices
-    )
+    if _llm_slices:
+        slice_names_text = "\n\n".join(
+            f"*Slice {s['num']}:* {s['name']}\n_{s['goal']}_"
+            + (f"\n_{s['why_first']}_" if s["why_first"] else "")
+            for s in _llm_slices if s["files"]
+        )
+        if _mvp_text:
+            slice_names_text += f"\n\n💡 *MVP:* {_mvp_text}"
+    else:
+        slice_names_text = "\n".join(
+            f"*Slice {num}:* "
+            + os.path.basename(fs[0]).replace("_", " ").replace(".py", "").title()
+            for num, fs in valid_slices
+        )
     reply_options = " · ".join(f"*slice {num}*" for num, _ in valid_slices)
 
     _strategy_labels = {

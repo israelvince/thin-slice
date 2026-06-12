@@ -8,3 +8,4 @@ flask>=3.0.0
 langgraph>=0.2.0
 langgraph-sdk>=0.1.39
 langchain-core>=0.1.0
+openai>=1.0.0

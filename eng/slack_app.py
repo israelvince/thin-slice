@@ -201,28 +201,33 @@ def post_slices_identified(say, thread_ts: str, state: HackathonAppState, token_
     )
     if token_count is None:
         token_count = inp
-    _a1_tokens = estimate_tokens(state.extracted_slice_context or "")
     say(
         text=(
             "*Agent 1 — Thin Slicer*\n"
             f"Files affected:\n{format_file_list(state.affected_files)}\n"
-            f"Estimated tokens: *{token_count:,}*\n"
-            f"_Used tokens: {_a1_tokens:,}_"
+            f"Estimated tokens for change: *{token_count:,}*\n"
+            f"`Tokens used by Agent 1: {len(state.user_request) // 4:,}`"
         ),
         thread_ts=thread_ts,
     )
 
 
-def post_cost_estimate(say, thread_ts: str, state: HackathonAppState, token_count: int) -> None:
+def post_cost_estimate(say, thread_ts: str, state: HackathonAppState) -> None:
     file_count = len(state.affected_files or [])
-    complexity = token_count / _BUDGET_THRESHOLD
-    _a2_tokens = 200
+    input_tokens, output_tokens, slice_cost, _ = _estimate_token_cost(
+        state.extracted_slice_context or state.user_request,
+        state.user_request,
+        file_count,
+    )
+    total_tokens = input_tokens + output_tokens
+    from ai.pricing import recommend_model as _price_rec
+    recommended_model, reason = _price_rec(total_tokens)
     say(
         text=(
             "*Agent 2 — Model Optimizer*\n"
-            f"Files: *{file_count}* | Complexity: *{complexity:.1f}x* safe-ship threshold | Tokens: *{token_count:,}*\n"
-            f"Recommended model: {recommend_model(token_count)}\n"
-            f"_Used tokens: {_a2_tokens:,}_"
+            f"Estimated tokens for change: *{input_tokens:,}* in · *{output_tokens:,}* out · *{total_tokens:,}* total\n"
+            f"Estimated cost: *${slice_cost:.4f}* | Suggested model: *{recommended_model}* — {reason}\n"
+            "`Tokens used by Agent 2: 150`"
         ),
         thread_ts=thread_ts,
     )
@@ -233,19 +238,19 @@ def post_generated_code(say, thread_ts: str, state: HackathonAppState, ledger: O
         say(text="*Agent 4 — Code Generator*\nNo code blocks were produced.", thread_ts=thread_ts)
         return
 
-    pr_url = state.pull_request_url or "Not created in this run"
-    a4_tokens = (
-        ledger["agent_4_generator"]["tokens"]
-        if ledger else estimate_tokens(str(state.generated_code_blocks))
+    pr_line = (
+        f"🔗 {state.pull_request_url}"
+        if state.pull_request_url
+        else "Ready to commit — no PR created in this run"
     )
+    agent_4_tokens = estimate_tokens(str(state.generated_code_blocks))
 
     say(
         text=(
             "*Agent 4 — Code Generator*\n"
             "✅ Change is safe to ship\n"
-            f"🔗 {pr_url}\n\n"
-            + format_code_blocks(state.generated_code_blocks)
-            + f"\n`Tokens used by Agent 4: {a4_tokens:,}`"
+            f"{pr_line}\n"
+            f"`Tokens used by Agent 4: {agent_4_tokens:,}`"
         ),
         thread_ts=thread_ts,
     )
@@ -796,19 +801,36 @@ def post_budget_check(say, thread_ts: str, token_count: int) -> None:
     _a3_tokens = _a3_ctx + 800
     _a3_cost = round(_a3_tokens * _MP[_S46][0], 6)
 
+    cost_triggered = token_count > _BUDGET_THRESHOLD
+    risk_triggered_here = overall_risk == "HIGH"
+    if cost_triggered and not risk_triggered_here:
+        verdict = "❌ Too costly to ship as a single PR."
+    elif risk_triggered_here and not cost_triggered:
+        verdict = "❌ Too risky to ship as a single PR."
+    else:
+        verdict = "❌ Too risky and costly to ship as a single PR."
+
+    valid_slices = [(dn, fs) for dn, _, fs in display_slices if fs]
+    slice_names_text = "\n".join(
+        f"*Slice {num}:* "
+        + os.path.basename(fs[0]).replace("_", " ").replace(".py", "").title()
+        for num, fs in valid_slices
+    )
+    reply_options = " · ".join(f"*slice {num}*" for num, _ in valid_slices)
+
     say(
         text=(
             "*Agent 3 — Risk Assessment*\n"
-            f"~{_count_lines(non_readme)} lines across {len(non_readme)} files"
-            f" | Estimated tokens for change: *{token_count:,}*/{_BUDGET_THRESHOLD}"
-            f" | Risk: *{overall_risk}* | Blast radius: {blast_radius}\n\n"
-            "❌ Too risky and costly to ship as a single PR.\n\n"
-            "These are the recommended slices:\n\n"
-            + "\n\n".join(slice_lines)
-            + readme_note
-            + "\n\nReply to select: "
-            + _slice_reply_options(display_slices)
-            + "\n`Tokens used by Agent 3: 200`"
+            f"~{_count_lines(non_readme)} lines across {len(non_readme)} files | "
+            f"Estimated tokens for change: {token_count:,}/{_BUDGET_THRESHOLD:,} | "
+            f"Risk: {overall_risk} | Blast radius: {blast_radius}\n"
+            "\n"
+            f"{verdict}\n"
+            "\n"
+            f"These are the recommended slices:\n{slice_names_text}\n"
+            "\n"
+            f"Reply to select: *go* — ship everything | *no go* — cancel | {reply_options} — pick specific slices\n"
+            "`Tokens used by Agent 3: 200`"
         ),
         thread_ts=thread_ts,
     )
@@ -883,7 +905,7 @@ def run_pipeline(say, channel: str, thread_ts: str, user_message: str) -> None:
     ledger["agent_3_risk"]["cost_usd"] = round(a3_cost, 6)
 
     post_slices_identified(say, thread_ts, state, token_count)
-    post_cost_estimate(say, thread_ts, state, token_count)
+    post_cost_estimate(say, thread_ts, state)
 
     snippets: Dict[str, str] = {}
     for chunk in ("\n" + (state.extracted_slice_context or "")).split("\n# FILE: "):
@@ -899,6 +921,7 @@ def run_pipeline(say, channel: str, thread_ts: str, user_message: str) -> None:
         post_budget_check(say, thread_ts, token_count)
         return
 
+    say(text="✅ *Change is within budget and safe to ship — generating code...*", thread_ts=thread_ts)
     state.policy_clearance = True
     state = _run_generator_and_pr(state)
 
@@ -1008,7 +1031,7 @@ def handle_budget_reply(message, say, logger):
             state.extracted_slice_context or "", state.user_request,
             len(state.affected_files or [])
         )
-        post_cost_estimate(say, thread_ts, state, token_count)
+        post_cost_estimate(say, thread_ts, state)
 
         snippets: Dict[str, str] = {}
         for chunk in ("\n" + (state.extracted_slice_context or "")).split("\n# FILE: "):

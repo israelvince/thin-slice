@@ -344,29 +344,6 @@ def post_token_ledger(say, thread_ts: str, state: HackathonAppState, ledger: dic
 
 # ── Agent 3 — Risk Assessment ─────────────────────────────────────────────────
 
-_OVERSIZED_SIGNALS = {
-    "entire codebase", "every service", "every file", "every pipeline",
-    "redesign", "real-time", "real time",
-    "comprehensive", "complete feature", "across every", "across all",
-    "weekly summary", "reporting module", "retry logic", "exponential backoff",
-}
-
-
-
-def _is_oversized_request(user_request: str) -> bool:
-    req = user_request.lower()
-
-    named_files = re.findall(r'\b\w+\.py\b', req)
-    # ≥4 named files means the change is cross-cutting — treat file count as a breadth signal
-    if len(named_files) >= 4:
-        return True
-    # 1–3 named files: user has scoped the change, bypass vagueness checks
-    if named_files:
-        return False
-
-    signal_hits = sum(1 for w in _OVERSIZED_SIGNALS if w in req)
-    scope_breadth = req.count(" and ")
-    return signal_hits >= 3 or (signal_hits >= 2 and scope_breadth >= 5)
 
 
 def _extract_change_subject(user_request: str) -> Optional[str]:
@@ -428,10 +405,6 @@ def _compute_risk(files: List[str], snippets: Dict[str, str]) -> tuple:
     risk_score = (2 if has_model else 0) + (2 if has_core else 0)
     return overall_risk, risk_score, folder_counts, 0, coupled
 
-
-def _shipping_risk_triggered(files: List[str], snippets: Dict[str, str]) -> bool:
-    overall_risk, _, _, _, _ = _compute_risk(files, snippets)
-    return overall_risk == "HIGH"
 
 
 def _slice_reply_options(display_slices: list) -> str:
@@ -596,7 +569,11 @@ def post_budget_check(say, thread_ts: str, token_count: int) -> None:
     ]
 
     # Store in display order: "slice 1" → first shown slice, "slice 2" → second, etc.
-    pending_slice_maps[thread_ts] = [fs for _, _, fs in display_slices]
+    if not display_slices:
+        display_slices = [(1, 2, non_readme)]
+        pending_slice_maps[thread_ts] = [non_readme]
+    else:
+        pending_slice_maps[thread_ts] = [fs for _, _, fs in display_slices]
 
     # ── Helpers ───────────────────────────────────────────────────────────────
 
@@ -852,22 +829,6 @@ def _run_generator_and_pr(state: HackathonAppState) -> HackathonAppState:
 
 
 def run_pipeline(say, channel: str, thread_ts: str, user_message: str) -> None:
-    if _is_oversized_request(user_message):
-        say(
-            text=(
-                "*Agent 1 — Thin Slicer*\n\n"
-                "This request spans too many concerns to ship safely as a single change.\n\n"
-                "_Shape Up: a good slice ships in 1–2 days and stays green in isolation. "
-                "This request has too many moving parts for that._\n\n"
-                "*Pick one of these to start:*\n"
-                "• What is the single most important change here?\n"
-                "• Which part breaks production if you ship nothing else?\n"
-                "• Start with the data model change, then layer behaviour on top\n\n"
-                "Refine your request to a single concern and I'll scope it properly."
-            ),
-            thread_ts=thread_ts,
-        )
-        return
 
     repo_path = resolve_repo_path(DEFAULT_TARGET_REPO)
     state = HackathonAppState(user_request=user_message, target_repo=repo_path)
@@ -924,12 +885,14 @@ def run_pipeline(say, channel: str, thread_ts: str, user_message: str) -> None:
         "comment", "docstring", "explain", "explanation", "add a note",
         "module-level", "what it means", "what ltv", "what ltv means",
     ))
-    risk_triggered = (
-        False if _is_annotation and len(state.affected_files or []) <= 2
-        else _shipping_risk_triggered(state.affected_files, snippets)
+    overall_risk_check = (
+        "LOW" if _is_annotation and len(state.affected_files or []) <= 2
+        else _compute_risk(state.affected_files, snippets)[0]
     )
+    cost_triggered = token_count > _BUDGET_THRESHOLD
+    risk_triggered = overall_risk_check == "HIGH"
 
-    if risk_triggered:
+    if cost_triggered or risk_triggered:
         state.policy_clearance = False
         pending_budget_checks[(channel, thread_ts)] = state
         post_budget_check(say, thread_ts, token_count)

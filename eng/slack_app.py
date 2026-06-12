@@ -652,7 +652,9 @@ def post_budget_check(say, thread_ts: str, token_count: int) -> None:
         "log ", "logging", "logger", "structured json", "log when", "log if",
         "observability", "structured log", "json log",
     ))
-    _is_annotation_req = _is_annotation_request(state.user_request)
+    _is_annotation_req = any(w in _req_lower for w in (
+        "log", "logging", "print", "comment", "docstring", "debug", "trace", "print statement"
+    ))
     _is_null_req = any(w in _req_lower for w in (
         "missing", "gracefully", "default to 0", "none check", "null", "no reviews",
     ))

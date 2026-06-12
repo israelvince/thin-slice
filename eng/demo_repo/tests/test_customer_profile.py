@@ -54,8 +54,3 @@ class TestProfileValidator:
         result = validate_profile(p)
         assert not result.is_valid
 
-# Updated by Thin-Slice
-
-# Updated by Thin-Slice
-
-# Updated by Thin-Slice

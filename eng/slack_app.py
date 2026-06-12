@@ -267,7 +267,7 @@ def post_generated_code(say, thread_ts: str, state: HackathonAppState, ledger: O
 
 
 def post_token_ledger(say, thread_ts: str, state: HackathonAppState, ledger: dict) -> None:
-    from ai.pricing import MODEL_PRICING, CLAUDE_HAIKU_45, CLAUDE_SONNET_46
+    from ai.pricing import MODEL_PRICING, HAIKU_45, SONNET_46
     total_tokens = sum(v["tokens"] for v in ledger.values())
     total_cost = sum(v["cost_usd"] for v in ledger.values())
 
@@ -279,7 +279,7 @@ def post_token_ledger(say, thread_ts: str, state: HackathonAppState, ledger: dic
     avg_tokens_per_file = 500
     _fr_inp = total_files * avg_tokens_per_file
     _fr_out = total_files * avg_tokens_per_file
-    _inp_p, _out_p = MODEL_PRICING[CLAUDE_SONNET_46]
+    _inp_p, _out_p = MODEL_PRICING[SONNET_46]
     full_regen_cost = (_fr_inp * _inp_p) + (_fr_out * _out_p)
 
     agent_rows = [
@@ -961,7 +961,7 @@ def post_budget_check(say, thread_ts: str, token_count: int) -> None:
         return "Testable: run targeted tests"
 
     # ── Per-slice cost estimate (using real pricing) ──────────────────────────
-    from ai.pricing import MODEL_PRICING, CLAUDE_SONNET_46 as _SONNET
+    from ai.pricing import MODEL_PRICING, SONNET_46 as _SONNET
     _inp_p, _out_p = MODEL_PRICING[_SONNET]
 
     def _slice_cost(fs: List[str]) -> str:
@@ -1017,7 +1017,7 @@ def post_budget_check(say, thread_ts: str, token_count: int) -> None:
     _total_inp, _total_out, _total_cost, _ = _estimate_token_cost(
         state.extracted_slice_context or "", state.user_request, len(non_readme)
     )
-    from ai.pricing import MODEL_PRICING as _MP, CLAUDE_SONNET_46 as _S46
+    from ai.pricing import MODEL_PRICING as _MP, SONNET_46 as _S46
     _a3_ctx = estimate_tokens(state.extracted_slice_context or "")
     _a3_tokens = _a3_ctx + 800
     _a3_cost = round(_a3_tokens * _MP[_S46][0], 6)
@@ -1116,7 +1116,7 @@ def run_pipeline(say, channel: str, thread_ts: str, user_message: str) -> None:
     repo_path = resolve_repo_path(DEFAULT_TARGET_REPO)
     state = HackathonAppState(user_request=user_message, target_repo=repo_path)
 
-    from ai.pricing import MODEL_PRICING, CLAUDE_HAIKU_45, CLAUDE_SONNET_46
+    from ai.pricing import MODEL_PRICING, HAIKU_45, SONNET_46
 
     ledger: Dict[str, Dict] = {
         "agent_1_slicer":    {"tokens": 0, "cost_usd": 0.0},
@@ -1138,19 +1138,19 @@ def run_pipeline(say, channel: str, thread_ts: str, user_message: str) -> None:
 
     # Agent 1: reads the slice context at Haiku rates (search + scan, no generation)
     a1_tokens = estimate_tokens(state.extracted_slice_context or "")
-    a1_cost = a1_tokens * MODEL_PRICING[CLAUDE_HAIKU_45][0]
+    a1_cost = a1_tokens * MODEL_PRICING[HAIKU_45][0]
     ledger["agent_1_slicer"]["tokens"] = a1_tokens
     ledger["agent_1_slicer"]["cost_usd"] = round(a1_cost, 6)
 
     # Agent 2: 200-token optimizer decision at Haiku rates
     a2_tokens = 200
-    a2_cost = a2_tokens * MODEL_PRICING[CLAUDE_HAIKU_45][0]
+    a2_cost = a2_tokens * MODEL_PRICING[HAIKU_45][0]
     ledger["agent_2_optimizer"]["tokens"] = a2_tokens
     ledger["agent_2_optimizer"]["cost_usd"] = round(a2_cost, 6)
 
     # Agent 3: reads full context + request to analyse risk at Sonnet rates
     a3_tokens = a1_tokens + 800  # context + analysis overhead
-    a3_cost = a3_tokens * MODEL_PRICING[CLAUDE_SONNET_46][0]
+    a3_cost = a3_tokens * MODEL_PRICING[SONNET_46][0]
     ledger["agent_3_risk"]["tokens"] = a3_tokens
     ledger["agent_3_risk"]["cost_usd"] = round(a3_cost, 6)
 
@@ -1189,7 +1189,7 @@ def run_pipeline(say, channel: str, thread_ts: str, user_message: str) -> None:
     a4_in_tokens = a1_tokens  # reads the same context
     a4_out_tokens = estimate_tokens(str(state.generated_code_blocks or {}))
     a4_tokens = a4_in_tokens + a4_out_tokens
-    _inp_p, _out_p = MODEL_PRICING[CLAUDE_SONNET_46]
+    _inp_p, _out_p = MODEL_PRICING[SONNET_46]
     a4_cost = (a4_in_tokens * _inp_p) + (a4_out_tokens * _out_p)
     ledger["agent_4_generator"]["tokens"] = a4_tokens
     ledger["agent_4_generator"]["cost_usd"] = round(a4_cost, 6)

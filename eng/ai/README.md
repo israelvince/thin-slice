@@ -12,6 +12,6 @@ The five-agent pipeline for Thin-Slice sliced regen with cost control.
 | `models/state.py` | — | `HackathonAppState` — Pydantic model flowing through all nodes |
 | `services/cost_policy.py` | 3 | Pricing table + `check_budget()` gate |
 | `services/token_monitor.py` | 5 | `TokenBudgetTracker` — runtime token/spend cap, `switch_to_cheaper()` mitigation |
-| `services/generator.py` | 4 | Anthropic API code generation (`claude-haiku-4-5` / `claude-sonnet-4-6`) |
+| `services/generator.py` | 4 | Anthropic API code generation (`haiku-4-5` / `sonnet-4-6`) |
 | `services/slice_planner.py` | 1 | Thin wrapper around `slicer.py` |
 | `services/orchestrator.py` | — | Runs all four nodes in sequence |

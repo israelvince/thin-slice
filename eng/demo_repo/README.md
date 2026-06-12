@@ -45,8 +45,3 @@ the contract is enforced at the type level across the entire product boundary.
 
 Raw CSVs live in `eng/data/ecommerce/` (Brazilian e-commerce public dataset).
 
-# Updated by Thin-Slice
-
-# Updated by Thin-Slice
-
-# Updated by Thin-Slice

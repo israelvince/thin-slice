@@ -20,8 +20,8 @@ from typing import Optional
 logger = logging.getLogger("thin_slice.generator_service")
 
 _ANTHROPIC_MODEL_MAP = {
-    "standard": "claude-haiku-4-5-20251001",
-    "high_reasoning": "claude-sonnet-4-6",
+    "standard": "haiku-4-5-20251001",
+    "high_reasoning": "sonnet-4-6",
 }
 
 _SYSTEM = (

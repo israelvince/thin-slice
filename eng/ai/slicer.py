@@ -67,7 +67,7 @@ def extract_constant_referenced_files(user_request: str, repo_path: str) -> list
                 with open(filepath, encoding='utf-8') as fh:
                     content = fh.read()
                 for const in constants:
-                    if _re.search(rf'^{const}\s*[:=]', content, _re.MULTILINE):
+                    if _re.search(rf'^[ \t]*{const}\s*[:=]', content, _re.MULTILINE):
                         rel = os.path.relpath(filepath, repo_path)
                         found.append(rel)
                         break

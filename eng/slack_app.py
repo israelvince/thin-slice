@@ -749,38 +749,58 @@ def post_budget_check(say, thread_ts: str, token_count: int) -> None:
         )
 
     # ── INVEST-compliant vertical slice generation ────────────────────────────
+    # Tests ship WITH their source layer — never as a separate slice.
+    # Each slice must be independently testable (INVEST: Testable).
 
-    # Assign each file to its semantic layer: 1=schema/contract, 2=logic/validation, 3=tests
-    layer_bins: Dict[int, List[str]] = {1: [], 2: [], 3: []}
+    layer_bins: Dict[int, List[str]] = {1: [], 2: []}
+
+    # Pass 1: assign non-test files to schema (1) or logic (2)
     for f in non_readme:
+        if "tests/" in f or os.path.basename(f).startswith("test_") or "/test_" in f:
+            continue
         if "models/" in f or "contracts/" in f:
             layer_bins[1].append(f)
-        elif "tests/" in f or os.path.basename(f).startswith("test_") or "/test_" in f:
-            layer_bins[3].append(f)
         elif "pipelines/" in f or "services/" in f:
             layer_bins[2].append(f)
         else:
             cat = folder_category(f)
-            if cat == "models":
-                layer_bins[1].append(f)
-            elif cat == "tests":
-                layer_bins[3].append(f)
-            else:
-                layer_bins[2].append(f)
+            layer_bins[1 if cat == "models" else 2].append(f)
 
-    # Fallback: when layer 1 (schema) is empty and layer 2 has >=3 files, use dep-graph
-    # to promote files that others import into "effective layer 1" (the unspoken contract)
+    # Build stem → layer so each test can be paired with its source layer
+    stem_to_layer = {
+        os.path.splitext(os.path.basename(f))[0]: layer
+        for layer, files in layer_bins.items()
+        for f in files
+    }
+
+    # Pass 2: assign each test to the layer of the file it covers
+    for f in non_readme:
+        if "tests/" not in f and not os.path.basename(f).startswith("test_") and "/test_" not in f:
+            continue
+        source_stem = re.sub(r'^test_', '', os.path.splitext(os.path.basename(f))[0])
+        layer_bins[stem_to_layer.get(source_stem, 2)].append(f)
+
+    # Fallback: when layer 1 (schema) is empty and layer 2 has >=3 non-test files,
+    # use dep-graph to promote imported files to layer 1; move their tests with them
     if not layer_bins[1] and len(layer_bins[2]) >= 3:
-        g = _dep_graph(layer_bins[2])
-        roots = [f for f in layer_bins[2]
-                 if any(f in g.get(other, []) for other in layer_bins[2] if other != f)]
+        non_test_l2 = [f for f in layer_bins[2]
+                       if "tests/" not in f and not os.path.basename(f).startswith("test_")]
+        g = _dep_graph(non_test_l2)
+        roots = [f for f in non_test_l2
+                 if any(f in g.get(other, []) for other in non_test_l2 if other != f)]
         if roots:
-            layer_bins[1] = roots
-            layer_bins[2] = [f for f in layer_bins[2] if f not in roots]
+            root_stems = {os.path.splitext(os.path.basename(r))[0] for r in roots}
+            root_set = set(roots)
+            layer_bins[1] = [
+                f for f in layer_bins[2]
+                if f in root_set or
+                re.sub(r'^test_', '', os.path.splitext(os.path.basename(f))[0]) in root_stems
+            ]
+            layer_bins[2] = [f for f in layer_bins[2] if f not in layer_bins[1]]
 
-    # Build sequential display list — skip empty layers, renumber 1,2,3 from the top
+    # Build sequential display list — skip empty layers, renumber from the top
     # Each entry: (display_num, semantic_layer, files)
-    ordered = [(sem, layer_bins[sem]) for sem in (1, 2, 3) if layer_bins[sem]]
+    ordered = [(sem, layer_bins[sem]) for sem in (1, 2) if layer_bins[sem]]
     display_slices: List[Tuple[int, int, List[str]]] = [
         (i + 1, sem, fs) for i, (sem, fs) in enumerate(ordered)
     ]
@@ -1058,12 +1078,22 @@ def post_budget_check(say, thread_ts: str, token_count: int) -> None:
         if _mvp_text:
             slice_names_text += f"\n\n💡 *MVP:* {_mvp_text}"
     else:
-        slice_names_text = "\n".join(
-            f"*Slice {num}:* "
-            + os.path.basename(fs[0]).replace("_", " ").replace(".py", "").title()
-            + f" · ${slice_exposure_by_num.get(num, 0):,.0f} review"
-            for num, fs in valid_slices
-        )
+        _LAYER_NAME = {1: "Data Contract", 2: "Business Logic"}
+        _LAYER_SCOPE = {
+            1: "Defines the shared schema and rules downstream computation depends on — ships with its tests",
+            2: "Stateless computation that reads the contract and produces derived values — ships with its tests",
+        }
+        det_parts = []
+        for dn, sem, fs in display_slices:
+            if not fs:
+                continue
+            mins = _review_minutes(len(fs), "LOW")
+            det_parts.append(
+                f"*Slice {dn}:* {_LAYER_NAME.get(sem, 'Supporting Change')}\n"
+                f"_{_LAYER_SCOPE.get(sem, 'Isolated change with limited blast radius')}_\n"
+                f"_{_fmt_time(mins)} review · Risk: LOW_"
+            )
+        slice_names_text = "\n\n".join(det_parts)
     reply_options = " · ".join(f"*slice {num}*" for num, _ in valid_slices)
 
     _strategy_labels = {

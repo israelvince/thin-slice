@@ -28,6 +28,7 @@ _BUDGET_THRESHOLD = int(os.environ.get("THIN_SLICE_TOKEN_THRESHOLD", "3000"))
 
 _MINS_PER_FILE = {"HIGH": 30, "MEDIUM": 20, "LOW": 12}
 _COUPLING_OVERHEAD_MINS = 30
+ENGINEER_HOURLY_RATE = float(os.environ.get("ENGINEER_HOURLY_RATE", "150"))
 
 
 def _review_minutes(file_count: int, risk: str, has_coupling: bool = False) -> int:
@@ -38,6 +39,11 @@ def _fmt_time(minutes: int) -> str:
     if minutes < 60:
         return f"~{minutes} min"
     return f"~{minutes / 60:.1f} hr"
+
+
+def _engineering_exposure(file_count: int, risk: str, has_coupling: bool = False) -> float:
+    """Engineering review cost in USD = review minutes × ENGINEER_HOURLY_RATE / 60."""
+    return round((_review_minutes(file_count, risk, has_coupling) / 60) * ENGINEER_HOURLY_RATE, 2)
 
 
 def _blast_radius_score(files: List[str], graph: Dict[str, List[str]]) -> int:
@@ -1025,19 +1031,37 @@ def post_budget_check(say, thread_ts: str, token_count: int) -> None:
     else:
         verdict = "❌ Too risky and costly to ship as a single PR."
 
+    # ── Engineering exposure ──────────────────────────────────────────────────
+    full_exposure = _engineering_exposure(len(non_readme), overall_risk, bool(coupled))
+    slice_exposure_by_num = {
+        dn: _engineering_exposure(len(fs), "LOW")
+        for dn, _, fs in display_slices if fs
+    }
+    total_slice_exposure = sum(slice_exposure_by_num.values())
+    exposure_savings = max(0.0, round(full_exposure - total_slice_exposure, 2))
+
     valid_slices = [(dn, fs) for dn, _, fs in display_slices if fs]
     if _llm_slices:
-        slice_names_text = "\n\n".join(
-            f"*Slice {s['num']}:* {s['name']}\n_{s['goal']}_"
-            + (f"\n_{s['why_first']}_" if s["why_first"] else "")
-            for s in _llm_slices if s["files"]
-        )
+        slice_parts = []
+        for s in _llm_slices:
+            if not s["files"]:
+                continue
+            exp = _engineering_exposure(len(s["files"]), "LOW")
+            mins = _review_minutes(len(s["files"]), "LOW")
+            part = (
+                f"*Slice {s['num']}:* {s['name']}\n_{s['goal']}_"
+                + (f"\n_{s['why_first']}_" if s["why_first"] else "")
+                + f"\n_{_fmt_time(mins)} review · ${exp:,.0f} engineering cost_"
+            )
+            slice_parts.append(part)
+        slice_names_text = "\n\n".join(slice_parts)
         if _mvp_text:
             slice_names_text += f"\n\n💡 *MVP:* {_mvp_text}"
     else:
         slice_names_text = "\n".join(
             f"*Slice {num}:* "
             + os.path.basename(fs[0]).replace("_", " ").replace(".py", "").title()
+            + f" · ${slice_exposure_by_num.get(num, 0):,.0f} review"
             for num, fs in valid_slices
         )
     reply_options = " · ".join(f"*slice {num}*" for num, _ in valid_slices)
@@ -1063,6 +1087,8 @@ def post_budget_check(say, thread_ts: str, token_count: int) -> None:
             f"Complexity: *{assessment['review_complexity']}*\n"
             f"Reversibility: *{assessment['reversibility']}* | "
             f"Confidence: *{assessment['confidence']}*\n"
+            f"Engineering exposure: *${full_exposure:,.0f}* as-is → *${total_slice_exposure:,.0f}* sliced"
+            + (f" · *${exposure_savings:,.0f}* protected" if exposure_savings > 0 else "") + "\n"
             "\n"
             f"{verdict}\n"
             "\n"

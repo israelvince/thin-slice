@@ -376,34 +376,142 @@ def _extract_change_subject(user_request: str) -> Optional[str]:
     return None
 
 
-def _compute_risk(files: List[str], snippets: Dict[str, str]) -> tuple:
-    """Return (overall_risk, risk_score, folder_counts, no_test_count, coupled_files)."""
+def _assess_request(
+    files: List[str], snippets: Dict[str, str], user_request: str = ""
+) -> dict:
+    """Evaluate a change request across 5 risk dimensions.
+
+    Returns a dict with: coupling, business_impact, review_complexity,
+    reversibility, confidence, overall_risk, trigger, slice_count, strategy,
+    folder_counts, coupled, risk_score.
+    """
     folder_counts = {
         cat: sum(1 for f in files if folder_category(f) == cat)
         for cat in ("models", "core", "tests", "docs", "config", "readme", "other")
     }
     has_model = folder_counts["models"] > 0
-    has_core = folder_counts["core"] > 0
+    has_core  = folder_counts["core"] > 0
     core_count = folder_counts["core"]
+    non_readme = [f for f in files if folder_category(f) != "readme"]
+    layer_diversity = sum(1 for c in ("models", "core", "tests", "docs") if folder_counts[c] > 0)
+    req_lower = user_request.lower()
+
+    # ── 1. Deployment coupling ────────────────────────────────────────────────
     coupled = (
         [f for f in files if folder_category(f) in ("models", "core")]
-        if has_model and has_core
-        else []
+        if has_model and has_core else []
     )
     if has_model and has_core:
-        # Schema + computation coupled — cannot deploy independently
-        overall_risk = "HIGH"
+        coupling = "HIGH"
     elif has_model:
-        # Schema change alone — breaks all downstream pipelines
-        overall_risk = "MEDIUM"
+        coupling = "MEDIUM"
+    else:
+        coupling = "LOW"
+
+    # ── 2. Business / data impact ─────────────────────────────────────────────
+    _HIGH_BIZ = {
+        "payment", "auth", "persist", "compliance", "access control",
+        "customer_id", "identity", "irreversible", "production decisioning",
+    }
+    _MED_BIZ = {
+        "score", "ltv", "churn", "metric", "export", "report",
+        "recommend", "classify", "aggregate",
+    }
+    _LOW_BIZ = {
+        "log", "comment", "docstring", "format", "readme",
+        "observability", "explain", "annotation",
+    }
+    if any(w in req_lower for w in _HIGH_BIZ):
+        business_impact = "HIGH"
+    elif any(w in req_lower for w in _LOW_BIZ):
+        business_impact = "LOW"
+    else:
+        business_impact = "MEDIUM"
+
+    # ── 3. Review complexity ──────────────────────────────────────────────────
+    file_count = len(non_readme)
+    if file_count > 5 or layer_diversity >= 3:
+        review_complexity = "HIGH"
+    elif file_count > 2 or layer_diversity == 2:
+        review_complexity = "MEDIUM"
+    else:
+        review_complexity = "LOW"
+
+    # ── 4. Reversibility (rollback risk) ─────────────────────────────────────
+    if has_model:
+        reversibility = "HIGH"
     elif has_core and core_count > 3:
-        # Many pipeline files at once — harder to verify in isolation
+        reversibility = "MEDIUM"
+    else:
+        reversibility = "LOW"
+
+    # ── 5. Confidence ─────────────────────────────────────────────────────────
+    named_files = re.findall(r'\b\w+\.py\b', req_lower)
+    found = sum(1 for nf in named_files if any(
+        os.path.basename(af).lower() == nf for af in files
+    ))
+    if named_files and found == len(named_files):
+        confidence = "HIGH"
+    elif named_files:
+        confidence = "MEDIUM"
+    elif len(user_request) > 800:
+        confidence = "LOW"
+    else:
+        confidence = "MEDIUM"
+
+    # ── Overall risk ──────────────────────────────────────────────────────────
+    dims = (coupling, business_impact, review_complexity, reversibility)
+    high_count = sum(1 for d in dims if d == "HIGH")
+    med_count  = sum(1 for d in dims if d == "MEDIUM")
+    if high_count >= 1 or confidence == "LOW":
+        overall_risk = "HIGH"
+    elif med_count >= 2:
         overall_risk = "MEDIUM"
     else:
-        # Single pipeline, validator, doc, or config — isolated and reversible
         overall_risk = "LOW"
+
+    trigger = overall_risk in ("HIGH", "MEDIUM") and not (
+        coupling == "LOW" and business_impact == "LOW" and confidence == "HIGH"
+    )
+
+    # ── Slice count (1–5, default 3) ──────────────────────────────────────────
+    if overall_risk == "LOW" and file_count <= 2:
+        slice_count = 1
+    elif overall_risk == "HIGH" or file_count > 5:
+        slice_count = min(5, max(3, file_count // 2))
+    else:
+        slice_count = 3
+
+    # ── Slicing strategy ──────────────────────────────────────────────────────
+    categories = [folder_category(f) for f in non_readme]
+    same_layer = len(set(categories)) == 1 and len(non_readme) > 1
+    if same_layer:
+        strategy = "vertical"
+    elif has_model:
+        strategy = "layer"
+    elif reversibility == "HIGH" or confidence == "LOW":
+        strategy = "risk-first"
+    else:
+        strategy = "layer"
+
     risk_score = (2 if has_model else 0) + (2 if has_core else 0)
-    return overall_risk, risk_score, folder_counts, 0, coupled
+
+    return {
+        "coupling": coupling,
+        "business_impact": business_impact,
+        "review_complexity": review_complexity,
+        "reversibility": reversibility,
+        "confidence": confidence,
+        "overall_risk": overall_risk,
+        "trigger": trigger,
+        "slice_count": slice_count,
+        "strategy": strategy,
+        "folder_counts": folder_counts,
+        "coupled": coupled,
+        "risk_score": risk_score,
+    }
+
+
 
 
 
@@ -472,7 +580,11 @@ def post_budget_check(say, thread_ts: str, token_count: int) -> None:
     )
     blast_label = "HIGH" if blast_radius >= 4 else "MEDIUM" if blast_radius >= 2 else "LOW"
 
-    overall_risk, _, folder_counts, no_test_count, coupled = _compute_risk(files, snippets)
+    assessment    = _assess_request(files, snippets, state.user_request)
+    overall_risk  = assessment["overall_risk"]
+    folder_counts = assessment["folder_counts"]
+    coupled       = assessment["coupled"]
+    no_test_count = 0
     subject = _extract_change_subject(state.user_request)
     subject_label = subject or "the change"
 
@@ -801,12 +913,25 @@ def post_budget_check(say, thread_ts: str, token_count: int) -> None:
     )
     reply_options = " · ".join(f"*slice {num}*" for num, _ in valid_slices)
 
+    _strategy_labels = {
+        "vertical": "Vertical slice",
+        "layer": "Layer slice",
+        "risk-first": "Risk-first slice",
+    }
+    strategy_label = _strategy_labels.get(assessment["strategy"], "Layer slice")
+
     say(
         text=(
             "*Agent 3 — Risk Assessment*\n"
             f"~{_count_lines(non_readme)} lines across {len(non_readme)} files | "
-            f"Estimated tokens for change: {token_count:,}/{_BUDGET_THRESHOLD:,} | "
-            f"Risk: {overall_risk} | Blast radius: {blast_radius}\n"
+            f"Tokens: {token_count:,}/{_BUDGET_THRESHOLD:,} | "
+            f"Strategy: {strategy_label}\n"
+            "\n"
+            f"Coupling: *{assessment['coupling']}* | "
+            f"Business impact: *{assessment['business_impact']}* | "
+            f"Complexity: *{assessment['review_complexity']}*\n"
+            f"Reversibility: *{assessment['reversibility']}* | "
+            f"Confidence: *{assessment['confidence']}*\n"
             "\n"
             f"{verdict}\n"
             "\n"
@@ -885,12 +1010,12 @@ def run_pipeline(say, channel: str, thread_ts: str, user_message: str) -> None:
         "comment", "docstring", "explain", "explanation", "add a note",
         "module-level", "what it means", "what ltv", "what ltv means",
     ))
-    overall_risk_check = (
-        "LOW" if _is_annotation and len(state.affected_files or []) <= 2
-        else _compute_risk(state.affected_files, snippets)[0]
-    )
+    if _is_annotation and len(state.affected_files or []) <= 2:
+        assessment = {"trigger": False, "overall_risk": "LOW"}
+    else:
+        assessment = _assess_request(state.affected_files, snippets, user_message)
     cost_triggered = token_count > _BUDGET_THRESHOLD
-    risk_triggered = overall_risk_check == "HIGH"
+    risk_triggered = assessment["trigger"]
 
     if cost_triggered or risk_triggered:
         state.policy_clearance = False

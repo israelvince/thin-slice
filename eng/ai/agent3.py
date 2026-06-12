@@ -128,23 +128,24 @@ def compute_risk(files: List[str], snippets: Dict[str, str]) -> Tuple[str, int, 
         cat: sum(1 for f in files if folder_category(f) == cat)
         for cat in ("models", "core", "tests", "docs", "config", "readme", "other")
     }
-    no_test_count = sum(
-        1 for f in files
-        if "test" not in f.lower()
-        and not re.search(r"\b(def test_|pytest|unittest|class Test)", snippets.get(f, ""), re.I)
-    )
+    has_model = folder_counts["models"] > 0
+    has_core = folder_counts["core"] > 0
+    core_count = folder_counts["core"]
     coupled = (
         [f for f in files if folder_category(f) in ("models", "core")]
-        if folder_counts["models"] > 0 and folder_counts["core"] > 0
+        if has_model and has_core
         else []
     )
-    risk_score = (
-        (2 if folder_counts["models"] > 0 else 0)
-        + (2 if folder_counts["core"] > 0 else 0)
-        + min(no_test_count, 2)
-    )
-    overall_risk = "HIGH" if risk_score >= 3 else "MEDIUM" if risk_score == 2 else "LOW"
-    return overall_risk, risk_score, folder_counts, no_test_count, coupled
+    if has_model and has_core:
+        overall_risk = "HIGH"
+    elif has_model:
+        overall_risk = "MEDIUM"
+    elif has_core and core_count > 3:
+        overall_risk = "MEDIUM"
+    else:
+        overall_risk = "LOW"
+    risk_score = (2 if has_model else 0) + (2 if has_core else 0)
+    return overall_risk, risk_score, folder_counts, 0, coupled
 
 
 # ── Value label from code ─────────────────────────────────────────────────────

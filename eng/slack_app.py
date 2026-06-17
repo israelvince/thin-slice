@@ -149,10 +149,10 @@ def extract_user_message(text: str) -> str:
 
 def recommend_model(token_count: int) -> str:
     if token_count < 500:
-        return "claude-haiku-4-5 (fastest, cheapest)"
+        return "haiku-4-5 (fastest, cheapest)"
     if token_count <= 4000:
-        return "claude-sonnet-4-6 (balanced)"
-    return "claude-sonnet-4-6 (large context)"
+        return "sonnet-4-6 (balanced)"
+    return "sonnet-4-6 (large context)"
 
 
 def format_file_list(files: List[str]) -> str:

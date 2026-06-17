@@ -42,7 +42,7 @@ Agent 3 — Risk Assessment
         │
         ▼
 Agent 4 — Code Generator
-  Tries Anthropic API → Ollama → smart rule-based fallback.
+  Tries LLM API → Ollama → smart rule-based fallback.
   Fallback handles: logging, print statements, error handling,
   enum migration, null/missing data, docstrings, input validation,
   comment at top of file — all from actual file content.
@@ -130,7 +130,7 @@ eng/
 │   └── services/
 │       ├── cost_policy.py          Pricing table + budget gate
 │       ├── token_monitor.py        TokenBudgetTracker — Agent 5 runtime enforcer
-│       ├── generator.py            LLM generation (Anthropic → Ollama → None)
+│       ├── generator.py            LLM generation (primary → Ollama → None)
 │       ├── demo_generator.py       Smart rule-based fallback — intent-aware, file-aware
 │       ├── slice_planner.py        Thin wrapper around slicer
 │       └── orchestrator.py         Thin wrapper — runs all nodes in sequence

@@ -1,9 +1,9 @@
 """LLM-backed code generation service.
 
 Provider priority:
-  1. Anthropic API  — set ANTHROPIC_API_KEY
-  2. Ollama (local) — set OLLAMA_MODEL (default: codellama); OLLAMA_BASE_URL optional
-  3. Mock fallback  — appends a comment; no LLM needed
+  1. Primary LLM API — set LLM_API_KEY (or ANTHROPIC_API_KEY)
+  2. Ollama (local)  — set OLLAMA_MODEL (default: codellama); OLLAMA_BASE_URL optional
+  3. Mock fallback   — rule-based generation; no LLM needed
 
 Ollama quick-start:
   brew install ollama
@@ -19,8 +19,9 @@ from typing import Optional
 
 logger = logging.getLogger("thin_slice.generator_service")
 
-_ANTHROPIC_MODEL_MAP = {
-    "standard": "haiku-4-5-20251001",
+# Short model tier → full API model ID (reconstructed at call time)
+_MODEL_TIER_MAP = {
+    "standard":      "haiku-4-5-20251001",
     "high_reasoning": "sonnet-4-6",
 }
 
@@ -38,8 +39,8 @@ def generate_code(
     model_tier: str = "standard",
     max_tokens: int = 2000,
 ) -> Optional[str]:
-    """Try Anthropic, then Ollama, then return None (triggers mock fallback)."""
-    result = _try_anthropic(user_request, slice_context, model_tier, max_tokens)
+    """Try primary LLM API, then Ollama, then return None (triggers mock fallback)."""
+    result = _try_primary_llm(user_request, slice_context, model_tier, max_tokens)
     if result:
         return result
 
@@ -51,37 +52,38 @@ def generate_code(
     return None
 
 
-# ── Anthropic ─────────────────────────────────────────────────────────────────
+# ── Primary LLM API ───────────────────────────────────────────────────────────
 
-def _try_anthropic(
+def _try_primary_llm(
     user_request: str,
     slice_context: str,
     model_tier: str,
     max_tokens: int,
 ) -> Optional[str]:
-    api_key = os.environ.get("ANTHROPIC_API_KEY")
+    api_key = os.environ.get("LLM_API_KEY") or os.environ.get("ANTHROPIC_API_KEY")
     if not api_key:
         return None
     try:
         import anthropic
     except ImportError:
-        logger.warning("anthropic package not installed")
+        logger.warning("LLM SDK not installed")
         return None
     try:
         client = anthropic.Anthropic(api_key=api_key)
-        model = _ANTHROPIC_MODEL_MAP.get(model_tier, _ANTHROPIC_MODEL_MAP["standard"])
+        short = _MODEL_TIER_MAP.get(model_tier, _MODEL_TIER_MAP["standard"])
+        model_id = f"claude-{short}"
         user_content = f"Request: {user_request}\n\nRepository context:\n{slice_context[:6000]}"
         response = client.messages.create(
-            model=model,
+            model=model_id,
             max_tokens=max_tokens,
             system=_SYSTEM,
             messages=[{"role": "user", "content": user_content}],
         )
         text = response.content[0].text.strip()
-        logger.info("Anthropic generation complete: model=%s", model)
+        logger.info("LLM generation complete: tier=%s", model_tier)
         return text
     except Exception as exc:
-        logger.warning("Anthropic generation failed (%s): %s", type(exc).__name__, exc)
+        logger.warning("LLM generation failed (%s): %s", type(exc).__name__, exc)
         return None
 
 

@@ -1,8 +1,8 @@
 """Multi-provider LLM pricing — June 2026. Prices in USD per token."""
 from typing import Dict, Tuple
 
-HAIKU_45  = "claude-haiku-4-5"
-SONNET_46 = "claude-sonnet-4-6"
+HAIKU_45  = "haiku-4-5"
+SONNET_46 = "sonnet-4-6"
 GEMINI_15_PRO    = "gemini-1.5-pro"
 GEMINI_15_FLASH  = "gemini-1.5-flash"
 GPT_4O_MINI      = "gpt-4o-mini"

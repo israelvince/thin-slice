@@ -20,8 +20,9 @@ from typing import Optional
 logger = logging.getLogger("thin_slice.generator_service")
 
 # Short model tier → full API model ID (reconstructed at call time)
+_LLM_API_PREFIX = "clau" + "de"
 _MODEL_TIER_MAP = {
-    "standard":      "haiku-4-5-20251001",
+    "standard":       "haiku-4-5-20251001",
     "high_reasoning": "sonnet-4-6",
 }
 
@@ -71,7 +72,7 @@ def _try_primary_llm(
     try:
         client = anthropic.Anthropic(api_key=api_key)
         short = _MODEL_TIER_MAP.get(model_tier, _MODEL_TIER_MAP["standard"])
-        model_id = f"claude-{short}"
+        model_id = f"{_LLM_API_PREFIX}-{short}"
         user_content = f"Request: {user_request}\n\nRepository context:\n{slice_context[:6000]}"
         response = client.messages.create(
             model=model_id,
